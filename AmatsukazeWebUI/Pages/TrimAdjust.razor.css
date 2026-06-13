@@ -385,7 +385,7 @@
     justify-content: center;
     gap: 4px;
     transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
-    touch-action: manipulation;
+    touch-action: none;
 }
 
 .trim-control-btn:hover {
