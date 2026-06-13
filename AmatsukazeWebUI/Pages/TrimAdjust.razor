@@ -1782,6 +1782,7 @@
         try
         {
             await Task.Delay(400, token);
+            var intervalMs = GetRepeatIntervalMs(commandId);
             while (!token.IsCancellationRequested)
             {
                 await InvokeAsync(() =>
@@ -1792,13 +1793,22 @@
                         StateHasChanged();
                     }
                 });
-                await Task.Delay(100, token);
+                await Task.Delay(intervalMs, token);
             }
         }
         catch (OperationCanceledException)
         {
         }
     }
+
+    private static int GetRepeatIntervalMs(string commandId) => commandId switch
+    {
+        TrimCmdBack1    or TrimCmdForward1 => 50,
+        TrimCmdBack2    or TrimCmdForward2 => 100,
+        TrimCmdBack3    or TrimCmdForward3 => 100,
+        TrimCmdBack4    or TrimCmdForward4 => 100,
+        _                                  => 100
+    };
 
     private void StopRepeat()
     {
