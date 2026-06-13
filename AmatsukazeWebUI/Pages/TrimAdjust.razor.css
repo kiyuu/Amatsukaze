@@ -193,6 +193,8 @@
     overflow: hidden;
     padding: 8px;
     gap: 6px;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 .trim-preview-container {
