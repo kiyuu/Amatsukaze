@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using Amatsukaze.Lib;
 using log4net;
 using log4net.Appender;
@@ -11,8 +12,18 @@ namespace Amatsukaze.Server
 {
     class ServerCLI
     {
+        [DllImport("libc", EntryPoint = "signal")]
+        private static extern nint SetSignalHandler(int signum, nint handler);
+
         static void Main(string[] args)
         {
+            // Linux: FFmpeg/AviSynth 等のネイティブライブラリが SIGPIPE ハンドラを
+            // SIG_DFL に戻す場合がある。クライアント切断時の send() クラッシュを防ぐ。
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                SetSignalHandler(13 /* SIGPIPE */, 1 /* SIG_IGN */);
+            }
+
             try
             {
                 Util.EnsureEncodingProviderRegistered();
