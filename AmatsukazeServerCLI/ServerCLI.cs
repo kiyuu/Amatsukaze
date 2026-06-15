@@ -12,8 +12,21 @@ namespace Amatsukaze.Server
 {
     class ServerCLI
     {
+        [DllImport("libc", EntryPoint = "signal")]
+        private static extern nint SetSignalHandler(int signum, nint handler);
+
+        private const int SignalSigpipe = 13;
+        private const int SignalHandlerIgnore = 1;
+
         static void Main(string[] args)
         {
+            // Linux: FFmpeg/AviSynth 等のネイティブライブラリが SIGPIPE ハンドラを
+            // SIG_DFL に戻す場合がある。クライアント切断時の send() クラッシュを防ぐ。
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                SetSignalHandler(SignalSigpipe, SignalHandlerIgnore);
+            }
+
             try
             {
                 GUIOPtion option = new GUIOPtion(args);
