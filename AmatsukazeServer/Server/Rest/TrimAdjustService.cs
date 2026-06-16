@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -725,6 +726,186 @@ namespace Amatsukaze.Server.Rest
             }
 
             return trims;
+        }
+
+        // amts0.datが存在しない場合にストリーム改革のみを再実行し、セッションを作成して返す
+        public async Task<(TrimAdjustSessionResponse response, string error)> TryRestoreAndCreateSessionAsync(
+            int queueItemId, int scaleMode, CancellationToken ct = default)
+        {
+            if (!state.TryGetQueueItem(queueItemId, out var item) || string.IsNullOrEmpty(item.SrcPath))
+            {
+                return (null, "キューアイテムが見つかりません");
+            }
+
+            var logPath = state.ResolveTaskLogPathById(queueItemId);
+            if (string.IsNullOrEmpty(logPath) || !File.Exists(logPath))
+            {
+                return (null, "ログファイルが見つかりません");
+            }
+
+            // ログから一時フォルダパスを取得（存在しなくてもパスとして使う）
+            var tempDir = ExtractTempDirFromLogAllowMissing(logPath);
+            if (string.IsNullOrEmpty(tempDir))
+            {
+                return (null, "ログファイルから一時フォルダが取得できませんでした");
+            }
+
+            var setting = state.GetSetting();
+            if (string.IsNullOrEmpty(setting?.AmatsukazePath))
+            {
+                return (null, "AmatsukazeCLIのパスが設定されていません");
+            }
+
+            // reform_only モードで実行
+            var args = BuildReformOnlyArgs(item.SrcPath, item.ServiceId, item.StreamFormat,
+                setting.ActualWorkPath, tempDir);
+
+            Util.AddLog($"[TrimAdjust] キャッシュ復元開始: queueItemId={queueItemId}, tempDir={tempDir}");
+            var (exitCode, output) = await RunProcessAsync(setting.AmatsukazePath, args, ct);
+
+            if (exitCode != 0)
+            {
+                Util.AddLog($"[TrimAdjust] キャッシュ復元失敗: exitCode={exitCode}\n{output}");
+                return (null, $"キャッシュ復元に失敗しました（終了コード: {exitCode}）");
+            }
+
+            Util.AddLog($"[TrimAdjust] キャッシュ復元完了: queueItemId={queueItemId}");
+
+            // trim.avsが存在しない場合はログから復元
+            var avsPath = item.SrcPath + ".trim.avs";
+            if (!File.Exists(avsPath))
+            {
+                var trimLine = ExtractTrimLineFromLog(logPath);
+                if (!string.IsNullOrEmpty(trimLine))
+                {
+                    try
+                    {
+                        File.WriteAllText(avsPath, trimLine);
+                        Util.AddLog($"[TrimAdjust] trim.avsをログから復元: {avsPath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Util.AddLog($"[TrimAdjust] trim.avs復元失敗（無視して続行）: {ex.Message}");
+                    }
+                }
+            }
+
+            // セッション作成
+            if (!TryCreateSession(new TrimAdjustSessionRequest { QueueItemId = queueItemId, ScaleMode = scaleMode },
+                out var response, out var sessionError))
+            {
+                return (null, sessionError ?? "セッション作成に失敗しました");
+            }
+
+            return (response, null);
+        }
+
+        private static string BuildReformOnlyArgs(
+            string srcPath, int serviceId, Amatsukaze.Server.VideoStreamFormat streamFormat,
+            string workPath, string tempDir)
+        {
+            var sb = new StringBuilder();
+            if (streamFormat != Amatsukaze.Server.VideoStreamFormat.MPEG2
+                && streamFormat != Amatsukaze.Server.VideoStreamFormat.H264)
+            {
+                sb.Append(" --loadv2");
+            }
+            sb.Append(" --mode reform_only");
+            sb.Append(" -i \"").Append(srcPath).Append("\"");
+            sb.Append(" -s ").Append(serviceId);
+            sb.Append(" -w \"").Append(workPath ?? ".").Append("\"");
+            sb.Append(" --tmpdir \"").Append(tempDir).Append("\"");
+            sb.Append(" --no-remove-tmp");
+            return sb.ToString().TrimStart();
+        }
+
+        private static async Task<(int exitCode, string output)> RunProcessAsync(
+            string exe, string args, CancellationToken ct)
+        {
+            var psi = new ProcessStartInfo(exe, args)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Util.AmatsukazeDefaultEncoding,
+                StandardErrorEncoding = Util.AmatsukazeDefaultEncoding,
+                CreateNoWindow = true,
+                WorkingDirectory = Directory.GetCurrentDirectory()
+            };
+            using var p = Process.Start(psi);
+            if (p == null)
+            {
+                return (-1, "プロセスの起動に失敗しました");
+            }
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
+            await p.WaitForExitAsync(ct);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+            return (p.ExitCode, stdout + stderr);
+        }
+
+        // ExtractTempDirFromLog の変形: 存在チェックなしでパスを返す（復元時はまだ存在しない）
+        private static string ExtractTempDirFromLogAllowMissing(string logPath)
+        {
+            try
+            {
+                var bytes = File.ReadAllBytes(logPath);
+                var content = Util.AmatsukazeDefaultEncoding.GetString(bytes);
+                var lines = content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+                foreach (var line in lines)
+                {
+                    var match = TempDirRegex.Match(line);
+                    if (match.Success)
+                    {
+                        var dir = match.Groups[1].Value.Trim().Trim('"');
+                        if (!string.IsNullOrEmpty(dir) && Path.IsPathRooted(dir))
+                        {
+                            return dir;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static readonly Regex TrimAvsHeaderRegex =
+            new Regex(@"\[CM解析結果 - TrimAVS\]", RegexOptions.Compiled);
+
+        // ログから [CM解析結果 - TrimAVS] の次行の Trim(...) 文字列を取得
+        private static string ExtractTrimLineFromLog(string logPath)
+        {
+            try
+            {
+                var bytes = File.ReadAllBytes(logPath);
+                var content = Util.AmatsukazeDefaultEncoding.GetString(bytes);
+                var lines = content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+                for (int i = 0; i < lines.Length - 1; i++)
+                {
+                    if (TrimAvsHeaderRegex.IsMatch(lines[i]))
+                    {
+                        // 次の空でない行を取得
+                        for (int j = i + 1; j < lines.Length; j++)
+                        {
+                            var candidate = lines[j].Trim();
+                            if (!string.IsNullOrEmpty(candidate) && candidate.StartsWith("Trim("))
+                            {
+                                return candidate;
+                            }
+                            if (!string.IsNullOrEmpty(candidate))
+                            {
+                                break; // Trim行でない行が来たら終了
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
         public void Dispose()
