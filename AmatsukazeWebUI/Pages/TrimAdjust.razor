@@ -38,7 +38,17 @@
 
     @if (_loading)
     {
-        <div class="trim-loading">読み込み中...</div>
+        @if (_restoringCache)
+        {
+            <div class="trim-loading">
+                一時キャッシュが見つかりません。ストリームデータを復元中です...<br />
+                （HDD: 1〜3分、SSD: 20〜40秒）
+            </div>
+        }
+        else
+        {
+            <div class="trim-loading">読み込み中...</div>
+        }
     }
     else if (!string.IsNullOrEmpty(_errorMessage))
     {
@@ -399,6 +409,7 @@
     private ElementReference _imgRef;
 
     private bool _loading = true;
+    private bool _restoringCache = false;
     private string? _errorMessage;
     private string? _statusMessage;
     private bool _isError;
@@ -768,10 +779,30 @@
 
         if (!result.Ok || result.Data == null)
         {
-            _errorMessage = result.Error ?? "セッションの作成に失敗しました";
-            _loading = false;
-            StateHasChanged();
-            return;
+            var errMsg = result.Error ?? "セッションの作成に失敗しました";
+            // amts0.dat が見つからない場合はストリーム改革を再実行して復元
+            if (errMsg.Contains("amts0.dat"))
+            {
+                _restoringCache = true;
+                StateHasChanged();
+                var restoreResult = await Api.RestoreTrimSessionAsync(QueueItemId, _previewScaleMode);
+                _restoringCache = false;
+                if (!restoreResult.Ok || restoreResult.Data == null)
+                {
+                    _errorMessage = restoreResult.Error ?? "キャッシュ復元に失敗しました";
+                    _loading = false;
+                    StateHasChanged();
+                    return;
+                }
+                result = restoreResult;
+            }
+            else
+            {
+                _errorMessage = errMsg;
+                _loading = false;
+                StateHasChanged();
+                return;
+            }
         }
 
         _errorMessage = null;
