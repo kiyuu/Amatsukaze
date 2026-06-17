@@ -760,16 +760,16 @@ namespace Amatsukaze.Server.Rest
             var args = BuildReformOnlyArgs(item.SrcPath, item.ServiceId, item.StreamFormat,
                 setting.ActualWorkPath, tempDir);
 
-            Util.AddLog($"[TrimAdjust] キャッシュ復元開始: queueItemId={queueItemId}, tempDir={tempDir}");
+            Util.AddLog($"[TrimAdjust] キャッシュ復元開始: queueItemId={queueItemId}, tempDir={tempDir}", null);
             var (exitCode, output) = await RunProcessAsync(setting.AmatsukazePath, args, ct);
 
             if (exitCode != 0)
             {
-                Util.AddLog($"[TrimAdjust] キャッシュ復元失敗: exitCode={exitCode}\n{output}");
+                Util.AddLog($"[TrimAdjust] キャッシュ復元失敗: exitCode={exitCode}\n{output}", null);
                 return (null, $"キャッシュ復元に失敗しました（終了コード: {exitCode}）");
             }
 
-            Util.AddLog($"[TrimAdjust] キャッシュ復元完了: queueItemId={queueItemId}");
+            Util.AddLog($"[TrimAdjust] キャッシュ復元完了: queueItemId={queueItemId}", null);
 
             // trim.avsが存在しない場合はログから復元
             var avsPath = item.SrcPath + ".trim.avs";
@@ -781,11 +781,11 @@ namespace Amatsukaze.Server.Rest
                     try
                     {
                         File.WriteAllText(avsPath, trimLine);
-                        Util.AddLog($"[TrimAdjust] trim.avsをログから復元: {avsPath}");
+                        Util.AddLog($"[TrimAdjust] trim.avsをログから復元: {avsPath}", null);
                     }
                     catch (Exception ex)
                     {
-                        Util.AddLog($"[TrimAdjust] trim.avs復元失敗（無視して続行）: {ex.Message}");
+                        Util.AddLog($"[TrimAdjust] trim.avs復元失敗（無視して続行）: {ex.Message}", ex);
                     }
                 }
             }
@@ -813,7 +813,7 @@ namespace Amatsukaze.Server.Rest
             sb.Append(" --mode reform_only");
             sb.Append(" -i \"").Append(srcPath).Append("\"");
             sb.Append(" -s ").Append(serviceId);
-            sb.Append(" -w \"").Append(workPath ?? ".").Append("\"");
+            sb.Append(" -w \"").Append(workPath ?? "./").Append("\"");
             sb.Append(" --tmpdir \"").Append(tempDir).Append("\"");
             sb.Append(" --no-remove-tmp");
             return sb.ToString().TrimStart();
@@ -845,7 +845,7 @@ namespace Amatsukaze.Server.Rest
             return (p.ExitCode, stdout + stderr);
         }
 
-        // ExtractTempDirFromLog の変形: 存在チェックなしでパスを返す（復元時はまだ存在しない）
+        // ExtractTempDirFromLog の変形: ディレクトリ存在チェックなしでパスを返す（復元時はまだ存在しない）
         private static string ExtractTempDirFromLogAllowMissing(string logPath)
         {
             try

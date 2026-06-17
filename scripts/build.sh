@@ -193,7 +193,7 @@ if [ "${USE_PREBUILT_FFNK}" = "1" ]; then
     FFNK_PKGCFG_PATH="${AMT_PKGCONFIG_FFNK_DIR}"
 fi
 BASELIBS_PKGCFG_PATH="${BUILD_DIR}/baselibs/lib/pkgconfig"
-(meson setup --buildtype release --pkg-config-path "${FFNK_PKGCFG_PATH}:${BASELIBS_PKGCFG_PATH}" "${SCRIPT_DIR}/.." && ninja) || exit 1
+(meson setup --buildtype $([ "$DEBUG_BUILD" = "true" ] && echo debug || echo release) --pkg-config-path "${FFNK_PKGCFG_PATH}:${BASELIBS_PKGCFG_PATH}" "${SCRIPT_DIR}/.." && ninja) || exit 1
 cd ..
 
 # ----- BS4K向け ffmpeg_6.1.2ベースのAmatsukazeCLIのビルド -----
@@ -220,7 +220,7 @@ FF612_PKGCFG_PATH="`pwd`/ffmpeg-6.1.2/build/lib/pkgconfig"
 if [ "${USE_PREBUILT_FF612}" = "1" ]; then
   FF612_PKGCFG_PATH="${AMT_PKGCONFIG_FF612_DIR}"
 fi
-(meson setup --buildtype release --pkg-config-path "${FF612_PKGCFG_PATH}:${BASELIBS_PKGCFG_PATH}" "${SCRIPT_DIR}/.." && ninja) || exit 1
+(meson setup --buildtype $([ "$DEBUG_BUILD" = "true" ] && echo debug || echo release) --pkg-config-path "${FF612_PKGCFG_PATH}:${BASELIBS_PKGCFG_PATH}" "${SCRIPT_DIR}/.." && ninja) || exit 1
 cp Amatsukaze/libAmatsukaze.so Amatsukaze/libAmatsukaze2.so
 cd ..
 
