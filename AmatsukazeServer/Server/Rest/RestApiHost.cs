@@ -1854,7 +1854,7 @@ namespace Amatsukaze.Server.Rest
             });
 
             // カット調整用: キャッシュ消失時にストリーム改革のみ再実行してセッションを返す
-            app.MapPost("/api/trim/sessions/restore/{queueItemId:int}", async (HttpContext ctx, int queueItemId, [Microsoft.AspNetCore.Mvc.FromQuery] int scaleMode) =>
+            app.MapPost("/api/trim/sessions/restore/{queueItemId:int}", async (int queueItemId, [Microsoft.AspNetCore.Mvc.FromQuery] int scaleMode) =>
             {
                 using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(5));
                 var (response, error) = await trimAdjust.TryRestoreAndCreateSessionAsync(queueItemId, scaleMode, cts.Token);
