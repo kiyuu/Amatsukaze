@@ -125,6 +125,7 @@ static void printHelp(const tchar* bin) {
         "                      8 : 1920x1080半透明\n"
         "                      ORも可 例) 15: すべて出力\n"
         "  --no-remove-tmp     一時ファイルを削除せずに残す\n"
+        "  --tmpdir <パス>     一時フォルダのパスを直接指定する（キャッシュ復元用）\n"
         "                      デフォルトは60fpsタイミングで生成\n"
         "  --timefactor <数値>  x265やNVEncで疑似VFRレートコントロールするときの時間レートファクター[0.25]\n"
         "  --pmt-cut <数値>:<数値>  PMT変更でCM認識するときの最大CM認識時間割合。全再生時間に対する割合で指定する。\n"
@@ -134,6 +135,7 @@ static void printHelp(const tchar* bin) {
         "  --mode <モード>     処理モード[ts]\n"
         "                      ts : MPGE2-TSを入力する通常エンコードモード\n"
         "                      cm : エンコードまで行わず、CM解析までで終了するモード\n"
+        "                      reform_only : ストリーム分割とamts0.dat生成のみで終了するモード（キャッシュ復元用）\n"
         "                      drcs : マッピングのないDRCS外字画像だけ出力するモード\n"
         "                      probe_subtitles : 字幕があるか判定\n"
         "                      probe_audio : 音声フォーマットを出力\n"
@@ -284,6 +286,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             if (conf.workDir.size() == 0) {
                 conf.workDir = _T("./");
             }
+        } else if (key == _T("--tmpdir")) {
+            conf.tmpDirExact = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("-et") || key == _T("--encoder-type")) {
             tstring arg = getParam(argc, argv, i++);
             conf.encoder = encoderFtomString(arg);
@@ -708,7 +712,7 @@ static int amatsukazeTranscodeMain(AMTContext& ctx, const ConfigWrapper& setting
         }
 
         tstring mode = setting.getMode();
-        if (mode == _T("ts") || mode == _T("cm"))
+        if (mode == _T("ts") || mode == _T("cm") || mode == _T("reform_only"))
             transcodeMain(ctx, setting);
         else if (mode == _T("g"))
             transcodeSimpleMain(ctx, setting);
