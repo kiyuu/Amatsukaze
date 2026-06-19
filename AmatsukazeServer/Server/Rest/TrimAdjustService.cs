@@ -420,6 +420,9 @@ namespace Amatsukaze.Server.Rest
         private readonly ConcurrentDictionary<string, TrimAdjustSession> sessions = new ConcurrentDictionary<string, TrimAdjustSession>();
         // TTL経過後に確実にクリーンアップされるよう、SessionTtl間隔でバックグラウンド実行する
         private readonly Timer cleanupTimer;
+        // キャッシュ復元の排他制御（グローバルで1つだけ実行許可）
+        private readonly object _restoreLock = new object();
+        private (int queueItemId, int scaleMode)? _restoringKey = null;
 
         public TrimAdjustService(RestStateStore state)
         {
@@ -732,72 +735,96 @@ namespace Amatsukaze.Server.Rest
         public async Task<(TrimAdjustSessionResponse response, string error)> TryRestoreAndCreateSessionAsync(
             int queueItemId, int scaleMode, CancellationToken ct = default)
         {
-            if (!state.TryGetQueueItem(queueItemId, out var item) || string.IsNullOrEmpty(item.SrcPath))
+            lock (_restoreLock)
             {
-                return (null, "キューアイテムが見つかりません");
-            }
-
-            var logPath = state.ResolveTaskLogPathById(queueItemId);
-            if (string.IsNullOrEmpty(logPath) || !File.Exists(logPath))
-            {
-                return (null, "ログファイルが見つかりません");
-            }
-
-            // ログから一時フォルダパスを取得（存在しなくてもパスとして使う）
-            var tempDir = ExtractTempDirFromLogAllowMissing(logPath);
-            if (string.IsNullOrEmpty(tempDir))
-            {
-                return (null, "ログファイルから一時フォルダが取得できませんでした");
-            }
-
-            var setting = state.GetSetting();
-            if (string.IsNullOrEmpty(setting?.AmatsukazePath))
-            {
-                return (null, "AmatsukazeCLIのパスが設定されていません");
-            }
-
-            // reform_only モードで実行
-            var args = BuildReformOnlyArgs(item.SrcPath, item.ServiceId, item.StreamFormat,
-                setting.ActualWorkPath, tempDir);
-
-            Util.AddLog($"[TrimAdjust] キャッシュ復元開始: queueItemId={queueItemId}, tempDir={tempDir}", null);
-            var (exitCode, output) = await RunProcessAsync(setting.AmatsukazePath, args, ct);
-
-            if (exitCode != 0)
-            {
-                Util.AddLog($"[TrimAdjust] キャッシュ復元失敗: exitCode={exitCode}\n{output}", null);
-                return (null, $"キャッシュ復元に失敗しました（終了コード: {exitCode}）");
-            }
-
-            Util.AddLog($"[TrimAdjust] キャッシュ復元完了: queueItemId={queueItemId}", null);
-
-            // trim.avsが存在しない場合はログから復元
-            var avsPath = item.SrcPath + ".trim.avs";
-            if (!File.Exists(avsPath))
-            {
-                var trimLine = ExtractTrimLineFromLog(logPath);
-                if (!string.IsNullOrEmpty(trimLine))
+                if (_restoringKey != null)
                 {
-                    try
+                    var current = _restoringKey.Value;
+                    if (current.queueItemId == queueItemId && current.scaleMode == scaleMode)
                     {
-                        File.WriteAllText(avsPath, trimLine);
-                        Util.AddLog($"[TrimAdjust] trim.avsをログから復元: {avsPath}", null);
+                        return (null, $"queueItemId={queueItemId} は現在キャッシュ復元中です。完了後にリトライしてください");
                     }
-                    catch (Exception ex)
+                    return (null, $"別のキャッシュ復元が実行中です (queueItemId={current.queueItemId})。完了後にリトライしてください");
+                }
+                _restoringKey = (queueItemId, scaleMode);
+            }
+
+            try
+            {
+                if (!state.TryGetQueueItem(queueItemId, out var item) || string.IsNullOrEmpty(item.SrcPath))
+                {
+                    return (null, "キューアイテムが見つかりません");
+                }
+
+                var logPath = state.ResolveTaskLogPathById(queueItemId);
+                if (string.IsNullOrEmpty(logPath) || !File.Exists(logPath))
+                {
+                    return (null, "ログファイルが見つかりません");
+                }
+
+                // ログから一時フォルダパスを取得（存在しなくてもパスとして使う）
+                var tempDir = ExtractTempDirFromLogAllowMissing(logPath);
+                if (string.IsNullOrEmpty(tempDir))
+                {
+                    return (null, "ログファイルから一時フォルダが取得できませんでした");
+                }
+
+                var setting = state.GetSetting();
+                if (string.IsNullOrEmpty(setting?.AmatsukazePath))
+                {
+                    return (null, "AmatsukazeCLIのパスが設定されていません");
+                }
+
+                // reform_only モードで実行
+                var args = BuildReformOnlyArgs(item.SrcPath, item.ServiceId, item.StreamFormat,
+                    setting.ActualWorkPath, tempDir);
+
+                Util.AddLog($"[TrimAdjust] キャッシュ復元開始: queueItemId={queueItemId}, tempDir={tempDir}", null);
+                var (exitCode, output) = await RunProcessAsync(setting.AmatsukazePath, args, ct);
+
+                if (exitCode != 0)
+                {
+                    Util.AddLog($"[TrimAdjust] キャッシュ復元失敗: exitCode={exitCode}\n{output}", null);
+                    return (null, $"キャッシュ復元に失敗しました（終了コード: {exitCode}）");
+                }
+
+                Util.AddLog($"[TrimAdjust] キャッシュ復元完了: queueItemId={queueItemId}", null);
+
+                // trim.avsが存在しない場合はログから復元
+                var avsPath = item.SrcPath + ".trim.avs";
+                if (!File.Exists(avsPath))
+                {
+                    var trimLine = ExtractTrimLineFromLog(logPath);
+                    if (!string.IsNullOrEmpty(trimLine))
                     {
-                        Util.AddLog($"[TrimAdjust] trim.avs復元失敗（無視して続行）: {ex.Message}", ex);
+                        try
+                        {
+                            File.WriteAllText(avsPath, trimLine);
+                            Util.AddLog($"[TrimAdjust] trim.avsをログから復元: {avsPath}", null);
+                        }
+                        catch (Exception ex)
+                        {
+                            Util.AddLog($"[TrimAdjust] trim.avs復元失敗（無視して続行）: {ex.Message}", ex);
+                        }
                     }
                 }
-            }
 
-            // セッション作成
-            if (!TryCreateSession(new TrimAdjustSessionRequest { QueueItemId = queueItemId, ScaleMode = scaleMode },
-                out var response, out var sessionError))
+                // セッション作成
+                if (!TryCreateSession(new TrimAdjustSessionRequest { QueueItemId = queueItemId, ScaleMode = scaleMode },
+                    out var response, out var sessionError))
+                {
+                    return (null, sessionError ?? "セッション作成に失敗しました");
+                }
+
+                return (response, null);
+            }
+            finally
             {
-                return (null, sessionError ?? "セッション作成に失敗しました");
+                lock (_restoreLock)
+                {
+                    _restoringKey = null;
+                }
             }
-
-            return (response, null);
         }
 
         private static string BuildReformOnlyArgs(
