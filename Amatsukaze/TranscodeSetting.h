@@ -162,7 +162,7 @@ enum AMT_PRINT_PREFIX {
 
 class TempDirectory : AMTObject, NonCopyable {
 public:
-    TempDirectory(AMTContext& ctx, const tstring& tmpdir, bool noRemoveTmp);
+    TempDirectory(AMTContext& ctx, const tstring& tmpdir, bool noRemoveTmp, const tstring& tmpDirExact = tstring());
     ~TempDirectory();
 
     void Initialize();
@@ -173,6 +173,7 @@ private:
     tstring path_;
     bool initialized_;
     bool noRemoveTmp_;
+    tstring tmpDirExact_;
 
     tstring genPath(const tstring& base, int code);
 };
@@ -184,6 +185,7 @@ const char* GetNicoJKSuffix(NicoJKType type);
 struct Config {
     // 一時フォルダ
     tstring workDir;
+    tstring tmpDirExact; // 一時フォルダのパスを直接指定（復元用）
     tstring mode;
     tstring modeArgs; // テスト用
     // 入力ファイルパス（拡張子を含む）

@@ -574,11 +574,12 @@ static std::string escapeXmlAttr(const std::string& s) {
     }
     return desc;
 }
-TempDirectory::TempDirectory(AMTContext& ctx, const tstring& tmpdir, bool noRemoveTmp)
+TempDirectory::TempDirectory(AMTContext& ctx, const tstring& tmpdir, bool noRemoveTmp, const tstring& tmpDirExact)
     : AMTObject(ctx)
     , path_(tmpdir)
     , initialized_(false)
-    , noRemoveTmp_(noRemoveTmp) {}
+    , noRemoveTmp_(noRemoveTmp)
+    , tmpDirExact_(tmpDirExact) {}
 TempDirectory::~TempDirectory() {
     if (!initialized_ || noRemoveTmp_) {
         return;
@@ -594,15 +595,21 @@ TempDirectory::~TempDirectory() {
 void TempDirectory::Initialize() {
     if (initialized_) return;
 
-    for (int code = (int)time(NULL) & 0xFFFFFF; code > 0; code++) {
-        auto path = genPath(path_, code);
-        if (mkdirT(path.c_str()) == 0) {
-            path_ = path;
-            break;
+    if (!tmpDirExact_.empty()) {
+        // 指定パスをそのまま使う（既存ディレクトリでも可）
+        mkdirT(tmpDirExact_.c_str()); // 既存の場合は失敗するが無視
+        path_ = tmpDirExact_;
+    } else {
+        for (int code = (int)time(NULL) & 0xFFFFFF; code > 0; code++) {
+            auto path = genPath(path_, code);
+            if (mkdirT(path.c_str()) == 0) {
+                path_ = path;
+                break;
+            }
         }
-    }
-    if (path_.size() == 0) {
-        THROW(IOException, "一時ディレクトリ作成失敗");
+        if (path_.size() == 0) {
+            THROW(IOException, "一時ディレクトリ作成失敗");
+        }
     }
 
     tstring abolutePath;
@@ -651,7 +658,7 @@ ConfigWrapper::ConfigWrapper(
     const Config& conf)
     : AMTObject(ctx)
     , conf(conf)
-    , tmpDir(ctx, conf.workDir, conf.noRemoveTmp) {
+    , tmpDir(ctx, conf.workDir, conf.noRemoveTmp, conf.tmpDirExact) {
     if (this->conf.encoderParallel <= 0) {
         this->conf.encoderParallel = 1;
     }
