@@ -536,6 +536,41 @@ namespace Amatsukaze.Shared
         public Task<ApiResult<bool>> DeleteTrimTempDirAsync(int queueItemId)
             => DeleteAsync($"/api/trim/tempdir/{queueItemId}");
 
+        public async Task<ApiResult<TrimAdjustSessionResponse>> RestoreTrimSessionAsync(int queueItemId, int scaleMode)
+        {
+            try
+            {
+                using var res = await http.PostAsync(
+                    $"/api/trim/sessions/restore/{queueItemId}?scaleMode={scaleMode}",
+                    content: null);
+                if (!res.IsSuccessStatusCode)
+                {
+                    var body = await res.Content.ReadAsStringAsync();
+                    string message = body;
+                    try
+                    {
+                        var obj = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(body);
+                        if (obj.TryGetProperty("message", out var msg))
+                        {
+                            message = msg.GetString() ?? body;
+                        }
+                    }
+                    catch { }
+                    return ApiResult<TrimAdjustSessionResponse>.Fail((int)res.StatusCode, message);
+                }
+                var data = await res.Content.ReadFromJsonAsync<TrimAdjustSessionResponse>(jsonOptions);
+                if (data == null)
+                {
+                    return ApiResult<TrimAdjustSessionResponse>.Fail((int)res.StatusCode, "Empty response");
+                }
+                return ApiResult<TrimAdjustSessionResponse>.Success(data, (int)res.StatusCode);
+            }
+            catch (Exception ex)
+            {
+                return ApiResult<TrimAdjustSessionResponse>.Fail(0, ex.Message);
+            }
+        }
+
         public Task<ApiResult<PathSuggestResponse>> GetPathSuggestAsync(PathSuggestRequest req)
         {
             var query = new List<string>();

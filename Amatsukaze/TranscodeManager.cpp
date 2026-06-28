@@ -712,7 +712,7 @@ void DoBadThing() {
     const_cast<ConfigWrapper&>(setting).CreateTempDir();
     setting.dump();
 
-    bool isNoEncode = (setting.getMode() == _T("cm"));
+    bool isNoEncode = (setting.getMode() == _T("cm") || setting.getMode() == _T("reform_only"));
 
     auto eoInfo = ParseEncoderOption(setting.getEncoder(), setting.getEncoderOptions());
     PrintEncoderInfo(ctx, eoInfo);
@@ -836,6 +836,11 @@ void DoBadThing() {
             reformInfo.getFilterSourceAudioFrames(videoFileIndex),
             setting.getDecoderSetting());
         ctx.infoF(_T("ソースファイル読み込み用データ保存完了[%d/%d]"), videoFileIndex + 1, numVideoFiles);
+    }
+
+    if (setting.getMode() == _T("reform_only")) {
+        ctx.info(_T("[reform_only] amts0.dat生成完了、処理終了"));
+        return;
     }
 
     // ロゴ・CM解析
