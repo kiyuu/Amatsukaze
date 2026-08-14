@@ -541,7 +541,7 @@ private:
         // Shift_JIS → UNICODE
         if (dwDstLen < 1)
             return -1;
-        char cShiftJIS[2];
+        char cShiftJIS[3] = {0};
         cShiftJIS[0] = (char)First;
         cShiftJIS[1] = (char)Second;
 #ifdef _MSC_VER
