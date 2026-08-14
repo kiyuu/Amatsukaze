@@ -602,6 +602,7 @@
     {
         InvokeAsync(() =>
         {
+            System.Console.WriteLine($"[TrimAdjust] OnFrameLoaded loadingFrame={_loadingFrame} current={_currentFrame}");
             _displayedFrame = _loadingFrame;
             _isFrameLoading = false;
             // まだ新しいフレームが要求されていれば続けてロード
@@ -1282,6 +1283,7 @@
     private void RequestFrameLoad()
     {
         if (_session == null) return;
+        System.Console.WriteLine($"[TrimAdjust] RequestFrameLoad enter current={_currentFrame} loading={_loadingFrame} isLoading={_isFrameLoading}");
         if (_isFrameLoading) return; // onload時に_currentFrameを拾って次をロードする
         if (_currentFrame == _loadingFrame && _isFrameLoading) return;
 
@@ -1316,6 +1318,7 @@
         }
 
         var res = await Api.GetTrimBundleAsync(_sessionId, frameNumber);
+        System.Console.WriteLine($"[TrimAdjust] LoadBundleForFrameAsync result frame={frameNumber} ok={res.Ok} jpegLen={res.Data?.VideoJpeg?.Length ?? -1} reqToken={reqToken} curToken={_bundleRequestToken}");
         if (reqToken != _bundleRequestToken)
         {
             return;

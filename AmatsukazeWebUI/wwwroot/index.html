@@ -294,10 +294,12 @@
             var img = document.querySelector('.trim-preview-img');
             if (img) {
                 img.onload = function () {
+                    console.log('[TrimAdjust] onload fired srcLen=' + (this.src ? this.src.length : 0));
                     dotNetRef.invokeMethodAsync('OnFrameLoaded');
                 };
                 img.onerror = function () {
                     var rawSrc = this.getAttribute('src') || '';
+                    console.log('[TrimAdjust] onerror fired isData=' + (rawSrc.indexOf('data:') === 0) + ' srcLen=' + rawSrc.length);
                     if (!rawSrc || rawSrc.indexOf('data:') === 0) {
                         return;
                     }
