@@ -184,7 +184,7 @@ enum AMT_PRINT_PREFIX {
 
 class TempDirectory : AMTObject, NonCopyable {
 public:
-    TempDirectory(AMTContext& ctx, const tstring& tmpdir, bool noRemoveTmp, const tstring& resumeDir);
+    TempDirectory(AMTContext& ctx, const tstring& tmpdir, bool noRemoveTmp, const tstring& resumeDir, const tstring& tmpDirExact = tstring());
     ~TempDirectory();
 
     void Initialize();
@@ -196,6 +196,7 @@ private:
     bool initialized_;
     bool noRemoveTmp_;
     tstring resumeDir_;
+    tstring tmpDirExact_;
 
     tstring genPath(const tstring& base, int code);
 };
@@ -208,6 +209,9 @@ struct Config {
     // 一時フォルダ
     tstring workDir;
     tstring resumeDir;
+    tstring tmpDirExact; // 一時フォルダのパスを直接指定（復元用）
+    tstring saveRestoreInfoPath; // 永続保存用の再開情報出力先
+    tstring restoreInfoPath; // キャッシュ再生成時の編集情報入力元
     tstring mode;
     tstring modeArgs; // テスト用
     // 入力ファイルパス（拡張子を含む）
@@ -353,6 +357,10 @@ public:
     tstring getModeArgs() const;
 
     tstring getResumeDir() const;
+
+    tstring getSaveRestoreInfoPath() const;
+
+    tstring getRestoreInfoPath() const;
 
     tstring getSrcFilePath() const;
 
