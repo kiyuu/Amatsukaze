@@ -211,6 +211,7 @@ struct Config {
     // 一時フォルダ
     tstring workDir;
     tstring resumeDir;
+    tstring resumeDatPath;
     tstring mode;
     tstring modeArgs; // テスト用
     // 入力ファイルパス（拡張子を含む）
@@ -357,6 +358,8 @@ public:
     tstring getModeArgs() const;
 
     tstring getResumeDir() const;
+
+    tstring getResumeDatPath() const;
 
     tstring getSrcFilePath() const;
 

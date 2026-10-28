@@ -4,11 +4,12 @@
 @using System.Globalization
 @using System.Text.Json
 @using System.Threading
+@using System.Threading.Tasks
 @inject IAmatsukazeApi Api
 @inject IJSRuntime JS
 @implements IAsyncDisposable
 
-<div class="trim-adjust-page" @onkeydown="OnKeyDown" @onkeydown:preventDefault="true" tabindex="0" @ref="_pageRef">
+<div class="trim-adjust-page" @onkeydown="OnKeyDown" @onkeydown:preventDefault="@(!_retryWaiting && _missingSourceRecoveryChoice == null)" tabindex="0" @ref="_pageRef">
     <div class="trim-toolbar">
         <button class="trim-btn trim-btn-sm" @onclick="ShowCheckLog" title="CM解析チェックログ">ログ</button>
         <button class="trim-btn trim-btn-sm @(_showJls && HasJlsSegments ? "trim-btn-active" : "")" @onclick="ToggleShowJls"
@@ -51,7 +52,30 @@
 
     @if (_loading)
     {
-        <div class="trim-loading">読み込み中...</div>
+        @if (_retryWaiting)
+        {
+            <div class="source-recovery-waiting-scroll">
+                <section class="source-recovery-waiting-panel" role="status" aria-live="polite">
+                    <div class="source-recovery-waiting-heading">
+                        <span class="source-recovery-waiting-icon" aria-hidden="true">⌛</span>
+                        <div>
+                            <h2>カット調整データの復元</h2>
+                            <p class="source-recovery-waiting-title">@_retryWaitMessage</p>
+                            <p class="source-recovery-caption">@_retryWaitModeText</p>
+                        </div>
+                    </div>
+                    <p class="source-recovery-waiting-copy">解析が完了すると、カット調整画面を開きます。</p>
+                    <p class="source-recovery-notice">待機を終了しても、キューの処理は継続します。</p>
+                    <div class="source-recovery-actions">
+                        <button class="source-recovery-button" type="button" @onclick="StopRetryWaiting">待機を終了</button>
+                    </div>
+                </section>
+            </div>
+        }
+        else
+        {
+            <div class="trim-loading"><span>読み込み中...</span></div>
+        }
     }
     else if (!string.IsNullOrEmpty(_errorMessage))
     {
@@ -509,7 +533,72 @@
     }
 </div>
 
+@if (_missingSourceRecoveryChoice != null && !_disposed)
+{
+    <div class="source-recovery-dialog-overlay"
+         @onclick="CancelMissingSourceRecovery"
+         @onkeydown="OnMissingSourceRecoveryKeyDown"
+         @onkeydown:stopPropagation="true">
+        <button class="source-recovery-focus-sentinel" type="button" aria-label="最後の操作へ移動"
+                @onfocus="FocusLastMissingSourceRecoveryControlAsync"></button>
+        <section class="source-recovery-dialog" role="dialog" aria-modal="true"
+                 aria-labelledby="source-recovery-dialog-title"
+                 aria-describedby="source-recovery-dialog-description source-recovery-dialog-error"
+                 @onclick:stopPropagation="true">
+            <header class="source-recovery-dialog-heading">
+                <h2 id="source-recovery-dialog-title">カット調整データを復元</h2>
+                <button class="source-recovery-close" type="button" aria-label="閉じる"
+                        @ref="_missingSourceRecoveryCloseRef"
+                        @onclick="CancelMissingSourceRecovery">×</button>
+            </header>
+            <p id="source-recovery-dialog-description" class="source-recovery-dialog-copy">
+                カット調整用のデータが見つからないため、元の録画からCM解析をやり直して復元します。
+            </p>
+            @if (!string.IsNullOrWhiteSpace(_missingSourceRecoveryPath))
+            {
+                <div class="source-recovery-file">
+                    <span class="source-recovery-label">対象ファイル</span>
+                    <code>@_missingSourceRecoveryPath</code>
+                </div>
+            }
+            <p id="source-recovery-dialog-error" class="source-recovery-error">@_missingSourceRecoveryError</p>
+            <button class="source-recovery-choice source-recovery-choice-normal" type="button"
+                    @onclick="(() => CompleteMissingSourceRecovery(MissingSourceRecoveryChoice.Normal))">
+                <span class="source-recovery-choice-icon" aria-hidden="true">↺</span>
+                <span class="source-recovery-choice-copy">
+                    <span class="source-recovery-choice-title">通常復元</span>
+                    <span class="source-recovery-choice-detail">通常の開始待ちに従ってCM解析を行います。</span>
+                </span>
+                <span class="source-recovery-choice-arrow" aria-hidden="true">›</span>
+            </button>
+            <button class="source-recovery-choice source-recovery-choice-force" type="button"
+                    @onclick="(() => CompleteMissingSourceRecovery(MissingSourceRecoveryChoice.ForceStart))">
+                <span class="source-recovery-choice-icon" aria-hidden="true">⚡</span>
+                <span class="source-recovery-choice-copy">
+                    <span class="source-recovery-choice-title">強制実行で復元</span>
+                    <span class="source-recovery-choice-detail">並列数・リソース制限を超えてCM解析を開始します。</span>
+                </span>
+                <span class="source-recovery-choice-arrow" aria-hidden="true">›</span>
+            </button>
+            <div class="source-recovery-actions">
+                <button class="source-recovery-button source-recovery-button-quiet" type="button"
+                        @ref="_missingSourceRecoveryCancelRef"
+                        @onclick="CancelMissingSourceRecovery">キャンセル</button>
+            </div>
+        </section>
+        <button class="source-recovery-focus-sentinel" type="button" aria-label="最初の操作へ移動"
+                @onfocus="FocusFirstMissingSourceRecoveryControlAsync"></button>
+    </div>
+}
+
 @code {
+    private enum MissingSourceRecoveryChoice
+    {
+        Cancel,
+        Normal,
+        ForceStart
+    }
+
     [Parameter]
     public int QueueItemId { get; set; }
 
@@ -584,6 +673,7 @@
     private ElementReference _seekBarRef;
 
     private bool _loading = true;
+    private bool _sessionLoadInProgress;
     private string? _errorMessage;
     private string? _statusMessage;
     private bool _isError;
@@ -612,6 +702,19 @@
     private int _loadingFrame; // 現在データを取得中のフレーム番号
     private bool _isFrameLoading; // データ取得中フラグ（画像イベントには依存しない）
     private bool _disposed;
+    private bool _retryRecoveryStarted;
+    private bool _retryWaiting;
+    private string? _retryWaitMessage;
+    private string? _retryWaitModeText;
+    private TaskCompletionSource<MissingSourceRecoveryChoice>? _missingSourceRecoveryChoice;
+    private string? _missingSourceRecoveryError;
+    private string? _missingSourceRecoveryPath;
+    private bool _focusMissingSourceRecoveryCancelOnRender;
+    private bool _restorePageFocusAfterRecoveryOnRender;
+    private ElementReference _missingSourceRecoveryCancelRef;
+    private ElementReference _missingSourceRecoveryCloseRef;
+    private CancellationTokenSource? _retryWaitCts;
+    private CancellationTokenSource? _sessionLoadCts;
 
     private string _prevThumbUrl = "";
     private string _nextThumbUrl = "";
@@ -659,6 +762,9 @@
     private string? _queueItemOutDir; // 再投入時の出力先フォルダ
     private int _queueItemPriority = 3; // 再投入時に引き継ぐ優先度
     private List<string>? _queueItemTags; // 再投入時に引き継ぐタグ（CM解析投入時と同一）
+    private ProcMode? _queueItemMode;
+    private string? _queueItemState;
+    private DateTime? _queueItemEncodeStart;
 
     // 長押しリピート用
     private CancellationTokenSource? _repeatCts;
@@ -693,6 +799,7 @@
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        if (_disposed) return;
         if (firstRender)
         {
             _objRef = DotNetObjectReference.Create(this);
@@ -700,6 +807,17 @@
             await LoadShowJlsSettingAsync();
             await LoadAudioSettingsAsync();
             await LoadSessionAsync();
+        }
+        if (_disposed) return;
+        if (_focusMissingSourceRecoveryCancelOnRender && _missingSourceRecoveryChoice != null)
+        {
+            _focusMissingSourceRecoveryCancelOnRender = false;
+            await _missingSourceRecoveryCancelRef.FocusAsync();
+        }
+        else if (_restorePageFocusAfterRecoveryOnRender && _missingSourceRecoveryChoice == null)
+        {
+            _restorePageFocusAfterRecoveryOnRender = false;
+            await _pageRef.FocusAsync();
         }
         if (_session?.AudioPlaybackEnabled == true && !_loading)
             await JS.InvokeVoidAsync("trimAdjustAudio.setup", _pageRef, _audioRef, _objRef);
@@ -966,30 +1084,247 @@
 
     private async Task LoadSessionAsync()
     {
+        if (_sessionLoadInProgress || _disposed) return;
+        _sessionLoadInProgress = true;
         _loading = true;
+        var sessionLoadCts = new CancellationTokenSource();
+        _sessionLoadCts = sessionLoadCts;
+        var sessionLoadToken = sessionLoadCts.Token;
         StateHasChanged();
-        await LoadTrimAdjustSettingsAsync();
-        // セッション作成前にキュー情報を取得し、プロファイルの初期選択に使う
-        await LoadQueueItemInfoAsync();
-
-        var result = await Api.CreateTrimSessionAsync(new TrimAdjustSessionRequest
+        try
         {
-            QueueItemId = QueueItemId,
-            ScaleMode = _previewScaleMode
-        });
+            await LoadTrimAdjustSettingsAsync();
+            sessionLoadToken.ThrowIfCancellationRequested();
+            if (_disposed) return;
+            // セッション作成前にキュー情報を取得し、プロファイルの初期選択に使う
+            await LoadQueueItemInfoAsync(sessionLoadToken);
+            sessionLoadToken.ThrowIfCancellationRequested();
+            if (_disposed) return;
 
-        if (!result.Ok || result.Data == null)
-        {
-            _errorMessage = result.Error ?? "セッションの作成に失敗しました";
-            _loading = false;
-            StateHasChanged();
-            return;
+            var result = await Api.CreateTrimSessionAsync(new TrimAdjustSessionRequest
+            {
+                QueueItemId = QueueItemId,
+                ScaleMode = _previewScaleMode
+            }, sessionLoadToken);
+            sessionLoadToken.ThrowIfCancellationRequested();
+            if (_disposed) return;
+
+            if ((!result.Ok || result.Data == null) && result.ErrorCode == "missing_source_cache")
+            {
+                if (!CanRecoverMissingSourceCache())
+                {
+                    _errorMessage = GetMissingSourceRecoveryMessage(result.Error);
+                    _loading = false;
+                    StateHasChanged();
+                    return;
+                }
+
+                var recoveryChoice = await ShowMissingSourceRecoveryDialogAsync(
+                    result.Error, _queueItemSrcPath, sessionLoadToken);
+                sessionLoadToken.ThrowIfCancellationRequested();
+                if (_disposed) return;
+                if (recoveryChoice == MissingSourceRecoveryChoice.Cancel)
+                {
+                    _errorMessage = result.Error ?? "セッションの作成に失敗しました";
+                    _loading = false;
+                    StateHasChanged();
+                    return;
+                }
+
+                var retryMode = recoveryChoice == MissingSourceRecoveryChoice.ForceStart
+                    ? TrimAdjustRetryMode.ForceStart
+                    : TrimAdjustRetryMode.Normal;
+                _retryWaiting = true;
+                _retryWaitMessage = "CM解析の完了を待っています。";
+                _retryWaitModeText = recoveryChoice == MissingSourceRecoveryChoice.ForceStart
+                    ? "強制実行で復元"
+                    : "通常復元";
+                var retryWaitCts = CancellationTokenSource.CreateLinkedTokenSource(sessionLoadToken);
+                _retryWaitCts = retryWaitCts;
+                var retryWaitToken = retryWaitCts.Token;
+                StateHasChanged();
+
+                TrimAdjustRetryResult retryResult;
+                try
+                {
+                    _retryRecoveryStarted = true;
+                    retryResult = await TrimAdjustRetryWorkflow.RecoverSessionAsync(
+                        Api, QueueItemId, _queueItemEncodeStart, _previewScaleMode, retryMode, retryWaitToken);
+                }
+                finally
+                {
+                    _retryWaiting = false;
+                    _retryWaitMessage = null;
+                    _retryWaitModeText = null;
+                    if (ReferenceEquals(_retryWaitCts, retryWaitCts))
+                    {
+                        _retryWaitCts = null;
+                    }
+                    retryWaitCts.Dispose();
+                }
+
+                sessionLoadToken.ThrowIfCancellationRequested();
+                if (_disposed) return;
+                if (retryWaitToken.IsCancellationRequested)
+                {
+                    _errorMessage = "待機を終了しました。キューの処理は継続しています。";
+                    _loading = false;
+                    StateHasChanged();
+                    return;
+                }
+                if (!retryResult.CanCreateSession)
+                {
+                    _errorMessage = retryResult.Message ?? "カット調整データを復元できませんでした。";
+                    _loading = false;
+                    StateHasChanged();
+                    return;
+                }
+
+                await LoadQueueItemInfoAsync(sessionLoadToken);
+                sessionLoadToken.ThrowIfCancellationRequested();
+                if (_disposed) return;
+                await InitializeTrimSessionAsync(retryResult.Session!, sessionLoadToken);
+                return;
+            }
+            else if (!result.Ok || result.Data == null)
+            {
+                _errorMessage = result.Error ?? "セッションの作成に失敗しました";
+                _loading = false;
+                StateHasChanged();
+                return;
+            }
+
+            sessionLoadToken.ThrowIfCancellationRequested();
+            if (_disposed) return;
+            await InitializeTrimSessionAsync(result.Data!, sessionLoadToken);
         }
+        catch (OperationCanceledException) when (sessionLoadToken.IsCancellationRequested || _disposed)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed && !sessionLoadToken.IsCancellationRequested)
+            {
+                _errorMessage = ex.Message;
+                _loading = false;
+                StateHasChanged();
+            }
+        }
+        finally
+        {
+            _sessionLoadInProgress = false;
+            if (ReferenceEquals(_sessionLoadCts, sessionLoadCts))
+            {
+                _sessionLoadCts = null;
+            }
+            sessionLoadCts.Dispose();
+        }
+    }
 
+    private async Task<MissingSourceRecoveryChoice> ShowMissingSourceRecoveryDialogAsync(
+        string? error, string? sourcePath, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disposed) return MissingSourceRecoveryChoice.Cancel;
+
+        var completion = new TaskCompletionSource<MissingSourceRecoveryChoice>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        _missingSourceRecoveryError = error ?? "amts0.datが見つかりません。";
+        _missingSourceRecoveryPath = sourcePath;
+        _focusMissingSourceRecoveryCancelOnRender = true;
+        _restorePageFocusAfterRecoveryOnRender = false;
+        _missingSourceRecoveryChoice = completion;
+        StateHasChanged();
+
+        try
+        {
+            return await completion.Task.WaitAsync(cancellationToken);
+        }
+        finally
+        {
+            if (ReferenceEquals(_missingSourceRecoveryChoice, completion))
+            {
+                _missingSourceRecoveryChoice = null;
+                _missingSourceRecoveryError = null;
+                _missingSourceRecoveryPath = null;
+                _focusMissingSourceRecoveryCancelOnRender = false;
+                if (!_disposed)
+                {
+                    _restorePageFocusAfterRecoveryOnRender = true;
+                    StateHasChanged();
+                }
+            }
+        }
+    }
+
+    private void CompleteMissingSourceRecovery(MissingSourceRecoveryChoice choice)
+    {
+        if (!_disposed)
+        {
+            _missingSourceRecoveryChoice?.TrySetResult(choice);
+        }
+    }
+
+    private void CancelMissingSourceRecovery()
+        => CompleteMissingSourceRecovery(MissingSourceRecoveryChoice.Cancel);
+
+    private void OnMissingSourceRecoveryKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            CancelMissingSourceRecovery();
+        }
+    }
+
+    private async Task FocusFirstMissingSourceRecoveryControlAsync()
+    {
+        var completion = _missingSourceRecoveryChoice;
+        if (_disposed || completion == null || completion.Task.IsCompleted) return;
+        await _missingSourceRecoveryCloseRef.FocusAsync();
+    }
+
+    private async Task FocusLastMissingSourceRecoveryControlAsync()
+    {
+        var completion = _missingSourceRecoveryChoice;
+        if (_disposed || completion == null || completion.Task.IsCompleted) return;
+        await _missingSourceRecoveryCancelRef.FocusAsync();
+    }
+
+    private bool CanRecoverMissingSourceCache()
+    {
+        return !_retryRecoveryStarted && _queueItemMode.HasValue &&
+            (_queueItemMode.Value == ProcMode.CMCheck || _queueItemMode.Value == ProcMode.TrimAdjust) &&
+            string.Equals(_queueItemState, "Complete", StringComparison.OrdinalIgnoreCase) &&
+            _queueItemEncodeStart.HasValue;
+    }
+
+    private string GetMissingSourceRecoveryMessage(string? error)
+    {
+        var message = error ?? "amts0.datが見つかりません。";
+        if (_queueItemMode == ProcMode.Batch || _queueItemMode == ProcMode.AutoBatch)
+        {
+            return $"{message}\nバッチ/自動バッチ項目はフルエンコードを実行するため、この画面から再試行できません。キュー画面でCM解析モードを選択して再実行してください。";
+        }
+        return $"{message}\nキュー項目がCM解析/Trim調整の完了状態ではないため、自動再試行できません。キュー画面で状態を確認してください。";
+    }
+
+    private void StopRetryWaiting()
+    {
+        if (!_disposed) _retryWaitCts?.Cancel();
+    }
+
+    private async Task InitializeTrimSessionAsync(
+        TrimAdjustSessionResponse session,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disposed) return;
         _errorMessage = null;
-        _session = result.Data;
+        _session = session;
         _sessionId = _session.SessionId;
         await LoadCmSegAsync();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disposed) return;
         _currentFrame = 0;
 
         // TrimsからEditPointsを構築
@@ -1052,9 +1387,11 @@
 
     // キューアイテム情報を取得（SrcPath, ProfileName, OutDir, Priority）
     private string? _queueItemProfileName;
-    private async Task LoadQueueItemInfoAsync()
+    private async Task LoadQueueItemInfoAsync(CancellationToken cancellationToken = default)
     {
-        var res = await Api.GetQueueAsync();
+        var res = await Api.GetQueueAsync(null, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disposed) return;
         if (res.Ok && res.Data != null)
         {
             var item = res.Data.Items.FirstOrDefault(i => i.Id == QueueItemId);
@@ -1064,6 +1401,9 @@
                 _queueItemProfileName = item.ProfileName;
                 _queueItemOutDir = item.OutDir;
                 _queueItemPriority = item.Priority;
+                _queueItemMode = item.Mode;
+                _queueItemState = item.State;
+                _queueItemEncodeStart = item.EncodeStart;
                 _queueItemTags = item.Tags != null && item.Tags.Count > 0
                     ? new List<string>(item.Tags)
                     : null;
@@ -2434,6 +2774,8 @@
 
     private void OnKeyDown(KeyboardEventArgs e)
     {
+        if (_disposed || _retryWaiting || _missingSourceRecoveryChoice != null) return;
+
         var shortcut = BuildShortcutFromEvent(e);
         if (!string.IsNullOrEmpty(shortcut) && _commandByShortcut.TryGetValue(shortcut, out var commandId))
         {
@@ -2635,6 +2977,8 @@
     public async ValueTask DisposeAsync()
     {
         _disposed = true;
+        _sessionLoadCts?.Cancel();
+        _retryWaitCts?.Cancel();
         await DisposeAudioAsync();
         Interlocked.Increment(ref _bundleRequestToken);
         Interlocked.Exchange(ref _thumbRequestToken, _bundleRequestToken);

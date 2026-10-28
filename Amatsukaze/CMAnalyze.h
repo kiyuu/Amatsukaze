@@ -68,6 +68,8 @@ public:
         const ConfigWrapper& setting);
 
     void analyze(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const bool analyzeChapterAndCM);
+    void analyzeResume(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const bool analyzeChapterAndCM);
+    static bool hasLogoOffInJL(const ConfigWrapper& setting);
 
     const tstring& getLogoPath() const { return logopath; }
     const tstring& getLogoMatchFailMessage() const { return logoMatchFailMessage; }
@@ -84,6 +86,7 @@ public:
     void inputDivFile(int numFrames, const tstring& divFilePath);
 
     void restore(const tstring& logoPath, const std::vector<int>& trims, const std::vector<int>& divs, const int numFrames);
+    void restoreLogoResult(const tstring& logoPath);
 
 private:
     class MySubProcess : public EventBaseSubProcess {
@@ -110,7 +113,7 @@ private:
 
     void analyzeLogo(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
 
-    void analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
+    void analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath, const bool useLogoInCM = true);
 
     tstring makeAVSFile(int videoFileIndex, const VideoFormat& inputFormat, const bool forChapterExe);
 
@@ -127,17 +130,15 @@ private:
 
     void chapterExe(int videoFileIndex, const VideoFormat& inputFormat, const tstring& avspath);
 
-    tstring MakeJoinLogoScpArgs(int videoFileIndex);
+    tstring MakeJoinLogoScpArgs(int videoFileIndex, const bool useLogoInCM);
 
-    void joinLogoScp(int videoFileIndex, int serviceId);
+    void joinLogoScp(int videoFileIndex, int serviceId, const bool useLogoInCM);
 
     void readTrimAVS(int videoFileIndex, int numFrames);
 
     void readTrimAVS(std::string str, int numFrames);
 
     void readDiv(int videoFileIndex, int numFrames);
-
-    bool logoOffInJL(const int videoFileIndex) const;
 
     bool readSceneChangesFromFile(const tstring& path);
 

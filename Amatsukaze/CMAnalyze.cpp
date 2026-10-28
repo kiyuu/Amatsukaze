@@ -96,7 +96,7 @@ void CMAnalyze::analyze(const int serviceId, const int videoFileIndex, const Vid
     // チャプター・CM解析
     if (analyzeChapterAndCM) {
         ctx.infoF(_T("チャプター・CM解析開始"));
-        const bool noLogoInCM = setting_.isNoLogoInCM() || logoOffInJL(videoFileIndex);
+        const bool noLogoInCM = setting_.isNoLogoInCM() || hasLogoOffInJL(setting_);
         if (noLogoInCM) {
             ctx.info(_T("チャプター・CM解析にロゴを使用しません。"));
         } else {
@@ -111,6 +111,51 @@ void CMAnalyze::analyze(const int serviceId, const int videoFileIndex, const Vid
     if (!setting_.isNoDelogo()) {
         analyzeLogo(serviceId, videoFileIndex, inputFormat, numFrames, sw, avsAnalyzeLogo);
     }
+}
+
+void CMAnalyze::analyzeResume(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const bool analyzeChapterAndCM) {
+    bool noLogoInCM = setting_.isNoLogoInCM();
+    if (analyzeChapterAndCM) {
+        noLogoInCM = noLogoInCM || hasLogoOffInJL(setting_);
+        ctx.infoF(_T("チャプター・CM解析開始"));
+        if (noLogoInCM) {
+            ctx.info(_T("チャプター・CM解析にロゴを使用しません。"));
+        }
+    }
+    const auto& eraseLogoPath = setting_.getEraseLogoPath();
+    auto printCachedLogoResult = [&]() {
+        if (setting_.getLogoPath().size() == 0 && eraseLogoPath.size() == 0) {
+            return;
+        }
+        ctx.info(_T("[ロゴ解析結果]"));
+        if (logopath.size() > 0) {
+            ctx.infoF(_T("マッチしたロゴ: %s"), logopath);
+            PrintFileAll(setting_.getTmpLogoFramePath(videoFileIndex));
+        }
+        for (int i = 0; i < (int)eraseLogoPath.size(); i++) {
+            ctx.infoF(_T("追加ロゴ%d: %s"), i + 1, eraseLogoPath[i]);
+            PrintFileAll(setting_.getTmpLogoFramePath(videoFileIndex, i));
+        }
+        logoAnalysisDone = true;
+    };
+
+    const bool printLogoBeforeChapter = analyzeChapterAndCM && !noLogoInCM;
+    if (printLogoBeforeChapter) {
+        printCachedLogoResult();
+    }
+    if (analyzeChapterAndCM) {
+        const auto avsChapterExe = makeAVSFile(videoFileIndex, inputFormat, true);
+        Stopwatch sw;
+        analyzeChapterCM(serviceId, videoFileIndex, inputFormat, numFrames, sw, avsChapterExe, !noLogoInCM);
+    }
+    if (!printLogoBeforeChapter && !setting_.isNoDelogo()) {
+        printCachedLogoResult();
+    }
+}
+
+void CMAnalyze::restoreLogoResult(const tstring& logoPath) {
+    logopath = logoPath;
+    logoAnalysisDone = true;
 }
 
 void CMAnalyze::analyzeLogo(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath) {
@@ -135,7 +180,7 @@ void CMAnalyze::analyzeLogo(const int serviceId, const int videoFileIndex, const
     }
 }
 
-void CMAnalyze::analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath) {
+void CMAnalyze::analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath, const bool useLogoInCM) {
     // チャプター解析
     ctx.info(_T("[無音・シーンチェンジ解析]"));
     sw.start();
@@ -148,7 +193,7 @@ void CMAnalyze::analyzeChapterCM(const int serviceId, const int videoFileIndex, 
     // CM推定
     ctx.info(_T("[CM解析]"));
     sw.start();
-    joinLogoScp(videoFileIndex, serviceId);
+    joinLogoScp(videoFileIndex, serviceId, useLogoInCM);
     ctx.infoF(_T("完了: %.2f秒"), sw.getAndReset());
 
     ctx.info(_T("[CM解析結果 - TrimAVS]"));
@@ -345,6 +390,7 @@ void CMAnalyze::restore(const tstring& logoPath, const std::vector<int>& trims, 
         makeCMZones(numFrames);
     }
 }
+
 CMAnalyze::MySubProcess::MySubProcess(const tstring& args, File* out, File* err)
     : EventBaseSubProcess(args)
     , out(out)
@@ -753,10 +799,10 @@ void CMAnalyze::chapterExe(int videoFileIndex, const VideoFormat& inputFormat, c
     }
 }
 
-tstring CMAnalyze::MakeJoinLogoScpArgs(int videoFileIndex) {
+tstring CMAnalyze::MakeJoinLogoScpArgs(int videoFileIndex, const bool useLogoInCM) {
     StringBuilderT sb;
     sb.append(_T("\"%s\""), setting_.getJoinLogoScpPath());
-    if (logopath.size() > 0) {
+    if (useLogoInCM && logopath.size() > 0) {
         sb.append(_T(" -inlogo \"%s\""), pathToOS(setting_.getTmpLogoFramePath(videoFileIndex)));
     }
     sb.append(_T(" -inscp \"%s\" -incmd \"%s\" -o \"%s\" -oscp \"%s\" -odiv \"%s\" %s"),
@@ -769,8 +815,8 @@ tstring CMAnalyze::MakeJoinLogoScpArgs(int videoFileIndex) {
     return sb.str();
 }
 
-void CMAnalyze::joinLogoScp(int videoFileIndex, int serviceId) {
-    auto args = MakeJoinLogoScpArgs(videoFileIndex);
+void CMAnalyze::joinLogoScp(int videoFileIndex, int serviceId, const bool useLogoInCM) {
+    auto args = MakeJoinLogoScpArgs(videoFileIndex, useLogoInCM);
     ctx.infoF(_T("%s"), args);
     // join_logo_scp向けの環境変数を設定
     const tstring clioutpath = setting_.getOutFileBaseWithoutPrefix() + _T(".") + setting_.getOutputExtention(setting_.getFormat());
@@ -871,8 +917,8 @@ void CMAnalyze::readSceneChanges(int videoFileIndex) {
     THROW(FormatException, "ChapterExe.exeの標準出力・標準エラー出力から解析結果が読めません");
 }
 
-bool CMAnalyze::logoOffInJL(const int videoFileIndex) const {
-    File file(setting_.getJoinLogoScpCmdPath(), _T("r"));
+bool CMAnalyze::hasLogoOffInJL(const ConfigWrapper& setting) {
+    File file(setting.getJoinLogoScpCmdPath(), _T("r"));
     std::string str;
     while (file.getline(str)) {
         // str の # 以降は削除する (コメント)

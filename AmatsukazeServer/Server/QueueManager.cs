@@ -19,6 +19,7 @@ namespace Amatsukaze.Server
         private static readonly Regex TaskTempDirRegex = new Regex(@"一時フォルダ\s*[:：]\s*(.+)", RegexOptions.Compiled);
         private static readonly Regex AmtTaskDirNameRegex = new Regex(@"^amt[0-9]+$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
         private EncodeServer server;
+        private readonly Action<QueueItem, Action> forceStartItem;
         private readonly object queueSync = new object();
 
         public List<QueueItem> Queue { get; private set; } = new List<QueueItem>();
@@ -81,7 +82,59 @@ namespace Amatsukaze.Server
         public QueueManager(EncodeServer server)
         {
             this.server = server;
+            forceStartItem = server.ForceStartItem;
         }
+
+        private enum QueueItemReadinessError
+        {
+            None,
+            ProfileNotSelected,
+            ServiceUnknown,
+            ServiceNotRegistered,
+            MissingLogo
+        }
+
+        private static (ProfileSetting Profile, int Priority) ResolveProfileAndPriority(
+            ProfileSetting resolvedProfile, int resolvedPriority, ProfileSetting pendingProfile, int currentPriority)
+        {
+            var profile = resolvedProfile != null ? ServerSupport.DeepCopy(resolvedProfile) : pendingProfile;
+            var priority = resolvedProfile != null && resolvedPriority > 0 ? resolvedPriority : currentPriority;
+            return (profile, priority);
+        }
+
+        private static QueueItemReadinessError GetQueueItemReadinessError(
+            QueueItem item, Dictionary<int, ServiceSettingElement> serviceMap, bool logoPendAsError)
+        {
+            if (item.Profile == null || item.Profile.Name == "プロファイル未選択")
+            {
+                return QueueItemReadinessError.ProfileNotSelected;
+            }
+            if (item.ServiceId == -1)
+            {
+                return QueueItemReadinessError.ServiceUnknown;
+            }
+            if (serviceMap == null || !serviceMap.TryGetValue(item.ServiceId, out var service))
+            {
+                return QueueItemReadinessError.ServiceNotRegistered;
+            }
+
+            var needsLogo = ((!item.Profile.DisableChapter && !item.Profile.NoLogoInCM) || !item.Profile.NoDelogo);
+            var hasLogo = service.LogoSettings != null && service.LogoSettings.Any(logo => logo != null && logo.CanUse(item.TsTime));
+            if (!logoPendAsError && needsLogo && !hasLogo)
+            {
+                return QueueItemReadinessError.MissingLogo;
+            }
+            return QueueItemReadinessError.None;
+        }
+
+        private static string GetQueueItemReadinessErrorMessage(QueueItemReadinessError error) => error switch
+        {
+            QueueItemReadinessError.ProfileNotSelected => "プロファイルが選択されていません",
+            QueueItemReadinessError.ServiceUnknown => "TS情報取得中",
+            QueueItemReadinessError.ServiceNotRegistered => "このTSのチャンネル設定がありません（追加し直してください）",
+            QueueItemReadinessError.MissingLogo => "ロゴ設定がありません",
+            _ => ""
+        };
 
         public void LoadAppData()
         {
@@ -349,25 +402,17 @@ namespace Amatsukaze.Server
                 }
                 else if (CheckProfile(item, waits))
                 {
-                    var map = server.ServiceMap;
-                    if (item.ServiceId == -1)
+                    var readinessError = GetQueueItemReadinessError(
+                        item, server.ServiceMap, server.AppData_.setting.LogoPendAsError);
+                    if (readinessError != QueueItemReadinessError.None)
                     {
-                        item.FailReason = "TS情報取得中";
-                        item.Reset();
-                    }
-                    else if (map.ContainsKey(item.ServiceId) == false)
-                    {
-                        item.FailReason = "このTSのチャンネル設定がありません（追加し直してください）";
-                        item.Reset();
-                    }
-                    else if (!server.AppData_.setting.LogoPendAsError // ロゴ設定をエラー扱いする場合はここでチェックせず、実際に処理してエラーを発生させる
-                        && (((!item.Profile.DisableChapter && !item.Profile.NoLogoInCM) || !item.Profile.NoDelogo) &&
-                        map[item.ServiceId].LogoSettings.Any(s => s.CanUse(item.TsTime)) == false))
-                    {
-                        item.FailReason = "ロゴ設定がありません";
+                        item.FailReason = GetQueueItemReadinessErrorMessage(readinessError);
                         item.Reset();
                         // ロゴ設定不足で保留になった場合は、設定に応じて自動補完を非同期実行する
-                        server.TryKickAutoLogoPending(item);
+                        if (readinessError == QueueItemReadinessError.MissingLogo)
+                        {
+                            server.TryKickAutoLogoPending(item);
+                        }
                     }
                     else
                     {
@@ -733,14 +778,298 @@ namespace Amatsukaze.Server
             waits.Add(NotifyQueueItemUpdate(item));
         }
 
+        private void ApplyResetStateItem(QueueItem target, ChangeItemData data, List<Task> waits)
+        {
+            // 指定されたモード変更を適用
+            if (data.Mode.HasValue)
+            {
+                target.Mode = data.Mode.Value;
+            }
+            // 指定されたプロファイル変更を適用
+            if (!string.IsNullOrEmpty(data.Profile))
+            {
+                target.ProfileName = data.Profile;
+            }
+            // リトライはプロファイル再適用も行う
+            UpdateProfileItem(target, waits);
+            ResetStateItem(target, waits);
+            waits.Add(server.NotifyMessage("リトライします", false));
+        }
+
+        private sealed class ForceStartRetryPlan
+        {
+            public ProfileSetting Profile { get; init; }
+            public int Priority { get; init; }
+        }
+
+        private sealed class ForceStartRetrySnapshot
+        {
+            private readonly ProfileSetting profile;
+            private readonly int priority;
+            private readonly QueueState state;
+            private readonly DateTime encodeStart;
+            private readonly TimeSpan encodeTime;
+            private readonly string failReason;
+            private readonly AutoLogoResultState autoLogoResult;
+            private readonly string autoLogoLastMessage;
+            private readonly bool autoLogoQueued;
+            private readonly bool autoLogoInProgress;
+
+            public ForceStartRetrySnapshot(QueueItem item)
+            {
+                profile = item.Profile;
+                priority = item.Priority;
+                state = item.State;
+                encodeStart = item.EncodeStart;
+                encodeTime = item.EncodeTime;
+                failReason = item.FailReason;
+                autoLogoResult = item.AutoLogoResult;
+                autoLogoLastMessage = item.AutoLogoLastMessage;
+                autoLogoQueued = item.AutoLogoQueued;
+                autoLogoInProgress = item.AutoLogoInProgress;
+            }
+
+            public void Restore(QueueItem item)
+            {
+                item.Profile = profile;
+                item.Priority = priority;
+                item.State = state;
+                item.EncodeStart = encodeStart;
+                item.EncodeTime = encodeTime;
+                item.FailReason = failReason;
+                item.AutoLogoResult = autoLogoResult;
+                item.AutoLogoLastMessage = autoLogoLastMessage;
+                item.AutoLogoQueued = autoLogoQueued;
+                item.AutoLogoInProgress = autoLogoInProgress;
+            }
+        }
+
+        private bool TryPrepareForceStartRetry(QueueItem candidate, out ForceStartRetryPlan plan, out string error)
+        {
+            plan = null;
+            error = null;
+
+            var profileResult = server.GetProfile(candidate, candidate.ProfileName);
+            var resolvedProfile = profileResult?.Profile;
+            var resolvedPriority = profileResult?.Priority ?? 0;
+            if (resolvedProfile == null)
+            {
+                // SelectProfileは失敗時にQueueItemを書き換えるため、呼び出し元から渡された複製だけを使う。
+                resolvedProfile = server.SelectProfile(candidate, out resolvedPriority);
+            }
+
+            var resolution = ResolveProfileAndPriority(
+                resolvedProfile, resolvedPriority, server.PendingProfile, candidate.Priority);
+            if (resolvedProfile == null || resolution.Profile == null ||
+                resolution.Profile.Name == server.PendingProfile.Name)
+            {
+                error = string.IsNullOrWhiteSpace(candidate.FailReason)
+                    ? "プロファイルが選択されていません"
+                    : candidate.FailReason;
+                return false;
+            }
+
+            candidate.Profile = resolution.Profile;
+            candidate.Priority = resolution.Priority;
+            var readinessError = GetQueueItemReadinessError(
+                candidate, server.ServiceMap, server.AppData_.setting.LogoPendAsError);
+            if (readinessError != QueueItemReadinessError.None)
+            {
+                error = GetQueueItemReadinessErrorMessage(readinessError);
+                return false;
+            }
+
+            plan = new ForceStartRetryPlan
+            {
+                Profile = resolution.Profile,
+                Priority = resolution.Priority
+            };
+            return true;
+        }
+
+        private async Task ChangeItemWithExpectedEncodeStartAndForceStart(ChangeItemData data)
+        {
+            string error = null;
+            Exception restoreError = null;
+            Exception forceStartError = null;
+            QueueItem itemToNotify = null;
+
+            lock (queueSync)
+            {
+                var target = Queue.FirstOrDefault(item => item.Id == data.ItemId);
+                if (target == null)
+                {
+                    error = "指定されたアイテムが見つかりません";
+                }
+                else if (!data.ExpectedEncodeStart.HasValue)
+                {
+                    error = "キューの完了時刻を確認できないため、強制実行を受け付けません。キュー画面で状態を確認してください";
+                }
+                else if (target.State != QueueState.Complete || target.IsActive ||
+                    !MatchesExpectedEncodeStart(target.EncodeStart, data.ExpectedEncodeStart.Value))
+                {
+                    error = "キュー状態が変化したためリトライを受け付けません。キュー画面で最新状態を確認してください";
+                }
+                else if (target.Mode != ProcMode.CMCheck && target.Mode != ProcMode.TrimAdjust)
+                {
+                    error = "CM解析またはTrim調整の完了項目だけを強制実行で再試行できます";
+                }
+                else if (server.MaintenancePaused)
+                {
+                    error = "更新の適用中のため開始できません";
+                }
+                else
+                {
+                    var candidate = ServerSupport.DeepCopy(target);
+                    if (TryPrepareForceStartRetry(candidate, out var plan, out error))
+                    {
+                        try
+                        {
+                            RestoreMovedInputFiles(target, false);
+                        }
+                        catch (Exception ex)
+                        {
+                            restoreError = ex;
+                        }
+
+                        if (restoreError == null && server.MaintenancePaused)
+                        {
+                            error = "更新の適用中のため開始できません";
+                        }
+                        else if (restoreError == null)
+                        {
+                            var snapshot = new ForceStartRetrySnapshot(target);
+                            var ownershipTransferred = false;
+                            itemToNotify = target;
+                            try
+                            {
+                                target.Profile = plan.Profile;
+                                target.Priority = plan.Priority;
+                                target.ResetAutoLogoAttempt();
+                                target.Reset();
+                                target.FailReason = "";
+                                target.State = QueueState.Queue;
+
+                                // ResetStateItemは通常スケジューラへ同期登録するため通さず、既存ForceStartだけを呼ぶ。
+                                // 直前の保守状態変更は状態を戻し、WorkerPoolでも最終確認する。
+                                if (server.MaintenancePaused)
+                                {
+                                    throw new InvalidOperationException("更新の適用中のため開始できません");
+                                }
+
+                                forceStartItem(target, () => ownershipTransferred = true);
+                                if (!ownershipTransferred)
+                                {
+                                    throw new InvalidOperationException("強制開始がキューに受け付けられませんでした");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                forceStartError = ex;
+                            }
+                            finally
+                            {
+                                // ForceStartがQueue.StartItemを受理する前に失敗した場合だけ、元の完了状態へ戻す。
+                                if (!ownershipTransferred)
+                                {
+                                    snapshot.Restore(target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (itemToNotify != null)
+            {
+                await NotifyQueueItemUpdate(itemToNotify);
+            }
+            if (error != null)
+            {
+                await server.NotifyError(error, false);
+                return;
+            }
+            if (restoreError != null)
+            {
+                await server.FatalError("ファイルの移動に失敗しました", restoreError);
+                return;
+            }
+            if (forceStartError != null)
+            {
+                await server.NotifyError($"強制開始に失敗しました。キュー画面で状態を確認してください。{forceStartError.Message}", false);
+            }
+            else
+            {
+                await server.NotifyMessage("強制実行でリトライします", false);
+            }
+        }
+
+        private Task ChangeItemWithExpectedEncodeStart(ChangeItemData data)
+        {
+            var waits = new List<Task>();
+            string error = null;
+            Exception restoreError = null;
+            lock (queueSync)
+            {
+                var target = Queue.FirstOrDefault(item => item.Id == data.ItemId);
+                if (target == null)
+                {
+                    error = "指定されたアイテムが見つかりません";
+                }
+                else if (target.State != QueueState.Complete || target.IsActive ||
+                    !MatchesExpectedEncodeStart(target.EncodeStart, data.ExpectedEncodeStart.Value))
+                {
+                    error = "キュー状態が変化したためリトライを受け付けません。キュー画面で最新状態を確認してください";
+                }
+                else
+                {
+                    try
+                    {
+                        RestoreMovedInputFiles(target, false);
+                    }
+                    catch (Exception ex)
+                    {
+                        restoreError = ex;
+                    }
+
+                    if (restoreError == null)
+                    {
+                        ApplyResetStateItem(target, data, waits);
+                    }
+                }
+            }
+
+            if (error != null)
+            {
+                return server.NotifyError(error, false);
+            }
+            if (restoreError != null)
+            {
+                return server.FatalError("ファイルの移動に失敗しました", restoreError);
+            }
+            return Task.WhenAll(waits);
+        }
+
+        private static bool MatchesExpectedEncodeStart(DateTime current, DateTime expected)
+        {
+            if (current.Kind == DateTimeKind.Unspecified || expected.Kind == DateTimeKind.Unspecified)
+            {
+                return current.Ticks == expected.Ticks;
+            }
+
+            return current.ToUniversalTime().Ticks == expected.ToUniversalTime().Ticks;
+        }
+
         // アイテムのProfileNameからプロファイルを決定して、
         // オプションでwaits!=nullのときはクライアントに通知
         // 戻り値: プロファイルが変更された場合（結果、エラーになった場合も含む）
         private bool UpdateProfileItem(QueueItem item, List<Task> waits)
         {
             var getResult = server.GetProfile(item, item.ProfileName);
-            var profile = (getResult != null) ? ServerSupport.DeepCopy(getResult.Profile) : server.PendingProfile;
-            var priority = (getResult != null && getResult.Priority > 0) ? getResult.Priority : item.Priority;
+            var resolution = ResolveProfileAndPriority(
+                getResult?.Profile, getResult?.Priority ?? 0, server.PendingProfile, item.Priority);
+            var profile = resolution.Profile;
+            var priority = resolution.Priority;
 
             if(item.Profile == null ||
                 item.Profile.Name != profile.Name ||
@@ -1129,6 +1458,15 @@ namespace Amatsukaze.Server
 
         public Task ChangeItem(ChangeItemData data)
         {
+            if (data.ChangeType == ChangeItemType.ResetStateAndForceStart)
+            {
+                return ChangeItemWithExpectedEncodeStartAndForceStart(data);
+            }
+            if (data.ChangeType == ChangeItemType.ResetState && data.ExpectedEncodeStart.HasValue)
+            {
+                return ChangeItemWithExpectedEncodeStart(data);
+            }
+
             if (data.ChangeType == ChangeItemType.RemoveCompleted)
             {
                 var waits = new List<Task>();
@@ -1199,20 +1537,7 @@ namespace Amatsukaze.Server
 
                 if (data.ChangeType == ChangeItemType.ResetState)
                 {
-                    // モード変更が指定されていれば適用
-                    if (data.Mode.HasValue)
-                    {
-                        target.Mode = data.Mode.Value;
-                    }
-                    // プロファイル変更が指定されていれば適用
-                    if (!string.IsNullOrEmpty(data.Profile))
-                    {
-                        target.ProfileName = data.Profile;
-                    }
-                    // リトライはプロファイル再適用も行う
-                    UpdateProfileItem(target, waits);
-                    ResetStateItem(target, waits);
-                    waits.Add(server.NotifyMessage("リトライします", false));
+                    ApplyResetStateItem(target, data, waits);
                 }
                 else if (data.ChangeType == ChangeItemType.UpdateProfile)
                 {

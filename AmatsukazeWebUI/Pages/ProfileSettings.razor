@@ -929,6 +929,7 @@ else
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("EnableCMLogFile")" @onchange="@(e => OnBoolChanged(e, "EnableCMLogFile"))" />CM解析ログファイルを出力先に生成する</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("SaveProfileText")" @onchange="@(e => OnBoolChanged(e, "SaveProfileText"))" />プロファイルの情報を出力先にテキストとして保存</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("NoRemoveTmp")" @onchange="@(e => OnBoolChanged(e, "NoRemoveTmp"))" />一時ファイルを削除せずに残す</label></td></tr>
+            <tr class="profile-check-row"><td colspan="2"><label class="settings-check" title="TSの隣に解析結果を保存し、次回は一致する結果を再利用します。利用できない場合は通常解析します。"><input type="checkbox" checked="@GetBoolValue("EnableAnalysisReuse")" @onchange="@(e => OnBoolChanged(e, "EnableAnalysisReuse"))" />解析結果を保存・再利用する</label></td></tr>
             <tr>
                 <th>PMT更新がある場合はCMとする</th>
                 <td>
