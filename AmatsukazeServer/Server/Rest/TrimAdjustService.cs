@@ -483,9 +483,14 @@ namespace Amatsukaze.Server.Rest
         }
 
         public bool TryCreateSession(TrimAdjustSessionRequest request, out TrimAdjustSessionResponse response, out string error)
+            => TryCreateSession(request, out response, out error, out _);
+
+        public bool TryCreateSession(TrimAdjustSessionRequest request, out TrimAdjustSessionResponse response,
+            out string error, out string errorCode)
         {
             response = null;
             error = null;
+            errorCode = null;
 
             if (request == null || request.QueueItemId <= 0)
             {
@@ -519,6 +524,7 @@ namespace Amatsukaze.Server.Rest
             if (!File.Exists(datFilePath))
             {
                 error = $"amts0.datが見つかりません: {datFilePath}";
+                errorCode = "missing_source_cache";
                 return false;
             }
 

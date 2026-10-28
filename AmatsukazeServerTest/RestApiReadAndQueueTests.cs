@@ -201,6 +201,136 @@ public sealed class RestApiReadAndQueueTests
         Assert.Equal("標準", item.ProfileName);
         Assert.Equal(QueueState.Encoding, item.State);
     }
+
+    [Fact]
+    public async Task 条件付きリトライが古い完了時刻ならHTTP200のエラー通知を返して項目を維持する()
+    {
+        await using var f = new RestEndpointTestFixture();
+        var expectedStart = new DateTime(2026, 10, 28, 12, 30, 0, DateTimeKind.Utc);
+        var currentStart = expectedStart.AddMinutes(1);
+        var item = RestQueueTestFixture.Item(1, QueueState.Complete);
+        item.Mode = ProcMode.CMCheck;
+        item.EncodeStart = currentStart;
+        await f.Queue.Seed(item);
+
+        var response = await f.Send("POST", "/api/queue/change", body: RestApiConfigurationTests.Json(new
+        {
+            itemId = item.Id,
+            changeType = "ResetState",
+            expectedEncodeStart = expectedStart,
+        }));
+
+        Assert.Equal(200, response.Status);
+        using var json = JsonDocument.Parse(response.Body);
+        Assert.True(json.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("error", json.RootElement.GetProperty("level").GetString());
+        Assert.Contains("キュー状態が変化", json.RootElement.GetProperty("message").GetString());
+        Assert.Equal(QueueState.Complete, item.State);
+        Assert.Equal(currentStart, item.EncodeStart);
+    }
+
+    [Fact]
+    public async Task ローカル保存時刻と同じ瞬間を示すUTC条件付きリトライを受け付ける()
+    {
+        await using var f = new RestEndpointTestFixture();
+        var localStart = new DateTime(2026, 10, 28, 21, 30, 0, DateTimeKind.Local);
+        var item = await SeedConditionalRetry(f, localStart);
+
+        var response = await f.Send("POST", "/api/queue/change", body: RestApiConfigurationTests.Json(new
+        {
+            itemId = item.Id,
+            changeType = "ResetState",
+            expectedEncodeStart = localStart.ToUniversalTime(),
+        }));
+
+        Assert.Equal(200, response.Status);
+        using var json = JsonDocument.Parse(response.Body);
+        Assert.Equal("info", json.RootElement.GetProperty("level").GetString());
+        Assert.Equal(QueueState.LogoPending, item.State);
+    }
+
+    [Fact]
+    public async Task ローカル保存時刻と異なるUTC条件付きリトライを拒否する()
+    {
+        await using var f = new RestEndpointTestFixture();
+        var localStart = new DateTime(2026, 10, 28, 21, 30, 0, DateTimeKind.Local);
+        var item = await SeedConditionalRetry(f, localStart);
+
+        var response = await f.Send("POST", "/api/queue/change", body: RestApiConfigurationTests.Json(new
+        {
+            itemId = item.Id,
+            changeType = "ResetState",
+            expectedEncodeStart = localStart.ToUniversalTime().AddMinutes(1),
+        }));
+
+        using var json = JsonDocument.Parse(response.Body);
+        Assert.Equal("error", json.RootElement.GetProperty("level").GetString());
+        Assert.Equal(QueueState.Complete, item.State);
+        Assert.Equal(localStart, item.EncodeStart);
+    }
+
+    [Fact]
+    public async Task キューAPIの時刻オフセットをそのまま返す条件付きリトライを受け付ける()
+    {
+        await using var f = new RestEndpointTestFixture();
+        var localStart = new DateTime(2026, 10, 28, 21, 30, 0, DateTimeKind.Local);
+        var item = await SeedConditionalRetry(f, localStart);
+        var queueResponse = await f.Send("GET", "/api/queue");
+        using var queueJson = JsonDocument.Parse(queueResponse.Body);
+        var encodedStart = Assert.Single(queueJson.RootElement.GetProperty("items").EnumerateArray())
+            .GetProperty("encodeStart").GetString();
+        Assert.Equal(localStart.ToUniversalTime(), DateTimeOffset.Parse(encodedStart!).UtcDateTime);
+
+        var response = await f.Send("POST", "/api/queue/change", body: JsonSerializer.Serialize(new
+        {
+            itemId = item.Id,
+            changeType = "ResetState",
+            expectedEncodeStart = encodedStart,
+        }));
+
+        using var json = JsonDocument.Parse(response.Body);
+        Assert.Equal("info", json.RootElement.GetProperty("level").GetString());
+        Assert.Equal(QueueState.LogoPending, item.State);
+    }
+
+    [Fact]
+    public async Task Unspecified時刻は従来どおり同じ壁時計値を条件付きリトライに使える()
+    {
+        await using var f = new RestEndpointTestFixture();
+        var unspecifiedStart = new DateTime(2026, 10, 28, 12, 30, 0, DateTimeKind.Unspecified);
+        var item = await SeedConditionalRetry(f, unspecifiedStart);
+
+        var response = await f.Send("POST", "/api/queue/change", body: RestApiConfigurationTests.Json(new
+        {
+            itemId = item.Id,
+            changeType = "ResetState",
+            expectedEncodeStart = unspecifiedStart,
+        }));
+
+        using var json = JsonDocument.Parse(response.Body);
+        Assert.Equal("info", json.RootElement.GetProperty("level").GetString());
+        Assert.Equal(QueueState.LogoPending, item.State);
+    }
+
+    private static async Task<QueueItem> SeedConditionalRetry(RestEndpointTestFixture fixture, DateTime encodeStart)
+    {
+        var profile = new ProfileSetting { Name = "標準", LastUpdate = DateTime.MinValue };
+        var item = RestQueueTestFixture.Item(1, QueueState.Complete);
+        item.Mode = ProcMode.CMCheck;
+        item.EncodeStart = encodeStart;
+        item.ProfileName = profile.Name;
+        item.Profile = profile;
+        RestQueueTestFixture.SetField(fixture.Queue.Server, "profiles",
+            new Dictionary<string, ProfileSetting> { [profile.Name] = profile });
+        RestQueueTestFixture.SetProperty(fixture.Queue.Server, "PendingProfile", new ProfileSetting { Name = "未選択" });
+        RestQueueTestFixture.SetProperty(fixture.Queue.Server, "AppData_", new EncodeServer.AppData
+        {
+            setting = new Setting(),
+            services = new ServiceSetting { ServiceMap = new Dictionary<int, ServiceSettingElement>() },
+        });
+        await fixture.Queue.Seed(item);
+        return item;
+    }
 }
 
 [Collection("REST一時保存先")]

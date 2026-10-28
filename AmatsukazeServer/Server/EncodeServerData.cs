@@ -517,6 +517,8 @@ namespace Amatsukaze.Server
         [DataMember]
         public bool NoRemoveTmp { get; set; }
         [DataMember]
+        public bool EnableAnalysisReuse { get; set; }
+        [DataMember]
         public bool DisableLogFile { get; set; }
         [DataMember]
         public bool EnableCMLogFile { get; set; }
@@ -1188,6 +1190,7 @@ namespace Amatsukaze.Server
             keyValueBool("エンコードログファイルを出力先に生成しない", profile.DisableLogFile);
             keyValueBool("CM解析ログファイルを出力先に生成する", profile.EnableCMLogFile);
             keyValueBool("一時ファイルを削除せずに残す", profile.NoRemoveTmp);
+            keyValueBool("解析結果を保存・再利用する", profile.EnableAnalysisReuse);
             keyValue("PMT更新によるCM認識", profile.EnablePmtCut
                 ? string.Format("{0}:{1}", profile.PmtCutHeadRate, profile.PmtCutTailRate) : "なし");
             keyValue("ロゴ最長フェードフレーム数指定", profile.EnableMaxFadeLength ? profile.MaxFadeLength.ToString() : "なし");
@@ -1844,6 +1847,7 @@ namespace Amatsukaze.Server
         ForceStart, // アイテムを強制的に開始
         RemoveSourceFile, // ソースTSを削除（通常or自動追加の完了した項目のみ有効）
         Move,       // リスト上で移動
+        ResetStateAndForceStart, // 完了項目をリセットして強制開始
     }
 
     [DataContract]
@@ -1865,6 +1869,8 @@ namespace Amatsukaze.Server
         public int Position { get; set; }
         [DataMember]
         public string RequestId { get; set; }
+        [DataMember]
+        public DateTime? ExpectedEncodeStart { get; set; }
     }
 
     [DataContract]

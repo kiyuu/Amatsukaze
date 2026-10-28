@@ -15,6 +15,12 @@ namespace Amatsukaze.Shared
 {
     public sealed class AmatsukazeApi : IAmatsukazeApi
     {
+        private sealed class QueueChangeResponse
+        {
+            public bool IsError { get; set; }
+            public string? Message { get; set; }
+        }
+
         private readonly HttpClient http;
         private readonly JsonSerializerOptions jsonOptions;
 
@@ -83,6 +89,9 @@ namespace Amatsukaze.Shared
             => PostJsonAsync("/api/system/cancel-sleep", new { }, _ => true);
 
         public Task<ApiResult<QueueView>> GetQueueAsync(QueueFilter? filter = null)
+            => GetQueueAsync(filter, CancellationToken.None);
+
+        public Task<ApiResult<QueueView>> GetQueueAsync(QueueFilter? filter, CancellationToken cancellationToken)
         {
             var query = new List<string>();
             if (filter != null)
@@ -119,7 +128,7 @@ namespace Amatsukaze.Shared
                 }
             }
             var url = "/api/queue" + (query.Count > 0 ? "?" + string.Join("&", query) : "");
-            return GetJsonAsync<QueueView>(url);
+            return GetJsonAsync<QueueView>(url, cancellationToken);
         }
 
         public Task<ApiResult<QueueChangesView>> GetQueueChangesAsync(long sinceVersion)
@@ -152,7 +161,38 @@ namespace Amatsukaze.Shared
             => PostJsonAsync("/api/queue/add", req, result => result.GetProperty("requestId").GetString() ?? "");
 
         public Task<ApiResult<bool>> ChangeQueueAsync(ChangeItemData req)
-            => PostJsonAsync("/api/queue/change", req, _ => true);
+            => ChangeQueueAsync(req, CancellationToken.None);
+
+        public async Task<ApiResult<bool>> ChangeQueueAsync(ChangeItemData req, CancellationToken cancellationToken)
+        {
+            var result = await PostJsonAsync("/api/queue/change", req, ParseQueueChangeResponse, cancellationToken);
+            if (!result.Ok)
+            {
+                return ApiResult<bool>.Fail(result.StatusCode, result.Error ?? "キュー操作に失敗しました", result.ErrorCode);
+            }
+            if (result.Data?.IsError == true)
+            {
+                return ApiResult<bool>.Fail(result.StatusCode, result.Data.Message ?? "キュー操作が拒否されました");
+            }
+            return ApiResult<bool>.Success(true, result.StatusCode);
+        }
+
+        private static QueueChangeResponse ParseQueueChangeResponse(JsonElement element)
+        {
+            if (element.ValueKind != JsonValueKind.Object)
+            {
+                return new QueueChangeResponse();
+            }
+
+            var isError = element.TryGetProperty("level", out var level) &&
+                level.ValueKind == JsonValueKind.String &&
+                string.Equals(level.GetString(), "error", StringComparison.OrdinalIgnoreCase);
+            var message = element.TryGetProperty("message", out var messageElement) &&
+                messageElement.ValueKind == JsonValueKind.String
+                ? messageElement.GetString()
+                : null;
+            return new QueueChangeResponse { IsError = isError, Message = message };
+        }
 
         public Task<ApiResult<bool>> MoveQueueManyAsync(QueueMoveManyRequest req)
             => PostJsonAsync("/api/queue/move-many", req, _ => true);
@@ -468,14 +508,19 @@ namespace Amatsukaze.Shared
         }
 
         // Trim調整
-        public async Task<ApiResult<TrimAdjustSessionResponse>> CreateTrimSessionAsync(TrimAdjustSessionRequest req)
+        public Task<ApiResult<TrimAdjustSessionResponse>> CreateTrimSessionAsync(TrimAdjustSessionRequest req)
+            => CreateTrimSessionAsync(req, CancellationToken.None);
+
+        public async Task<ApiResult<TrimAdjustSessionResponse>> CreateTrimSessionAsync(
+            TrimAdjustSessionRequest req,
+            CancellationToken cancellationToken)
         {
             try
             {
-                using var res = await http.PostAsJsonAsync("/api/trim/sessions", req, jsonOptions);
+                using var res = await http.PostAsJsonAsync("/api/trim/sessions", req, jsonOptions, cancellationToken);
                 if (!res.IsSuccessStatusCode)
                 {
-                    var body = await res.Content.ReadAsStringAsync();
+                    var body = await res.Content.ReadAsStringAsync(cancellationToken);
                     var message = body;
                     try
                     {
@@ -485,6 +530,10 @@ namespace Amatsukaze.Shared
                         {
                             message = m.GetString() ?? body;
                         }
+                        var errorCode = root.TryGetProperty("errorCode", out var code) && code.ValueKind == JsonValueKind.String
+                            ? code.GetString()
+                            : null;
+                        return ApiResult<TrimAdjustSessionResponse>.Fail((int)res.StatusCode, message, errorCode);
                     }
                     catch
                     {
@@ -492,7 +541,7 @@ namespace Amatsukaze.Shared
                     }
                     return ApiResult<TrimAdjustSessionResponse>.Fail((int)res.StatusCode, message);
                 }
-                var data = await res.Content.ReadFromJsonAsync<TrimAdjustSessionResponse>(jsonOptions);
+                var data = await res.Content.ReadFromJsonAsync<TrimAdjustSessionResponse>(jsonOptions, cancellationToken);
                 if (data == null)
                 {
                     return ApiResult<TrimAdjustSessionResponse>.Fail((int)res.StatusCode, "Empty response");
@@ -625,16 +674,19 @@ namespace Amatsukaze.Shared
             return GetJsonAsync<PathSuggestResponse>(url);
         }
 
-        private async Task<ApiResult<T>> GetJsonAsync<T>(string url)
+        private Task<ApiResult<T>> GetJsonAsync<T>(string url)
+            => GetJsonAsync<T>(url, CancellationToken.None);
+
+        private async Task<ApiResult<T>> GetJsonAsync<T>(string url, CancellationToken cancellationToken)
         {
             try
             {
-                using var res = await http.GetAsync(url);
+                using var res = await http.GetAsync(url, cancellationToken);
                 if (!res.IsSuccessStatusCode)
                 {
-                    return ApiResult<T>.Fail((int)res.StatusCode, await res.Content.ReadAsStringAsync());
+                    return ApiResult<T>.Fail((int)res.StatusCode, await res.Content.ReadAsStringAsync(cancellationToken));
                 }
-                var data = await res.Content.ReadFromJsonAsync<T>(jsonOptions);
+                var data = await res.Content.ReadFromJsonAsync<T>(jsonOptions, cancellationToken);
                 if (data == null)
                 {
                     return ApiResult<T>.Fail((int)res.StatusCode, "Empty response");
@@ -684,15 +736,22 @@ namespace Amatsukaze.Shared
         }
 
         private async Task<ApiResult<T>> PostJsonAsync<T>(string url, object payload, Func<JsonElement, T> map)
+            => await PostJsonAsync(url, payload, map, CancellationToken.None);
+
+        private async Task<ApiResult<T>> PostJsonAsync<T>(
+            string url,
+            object payload,
+            Func<JsonElement, T> map,
+            CancellationToken cancellationToken)
         {
             try
             {
-                using var res = await http.PostAsJsonAsync(url, payload, jsonOptions);
+                using var res = await http.PostAsJsonAsync(url, payload, jsonOptions, cancellationToken);
                 if (!res.IsSuccessStatusCode)
                 {
-                    return ApiResult<T>.Fail((int)res.StatusCode, await res.Content.ReadAsStringAsync());
+                    return ApiResult<T>.Fail((int)res.StatusCode, await res.Content.ReadAsStringAsync(cancellationToken));
                 }
-                var element = await res.Content.ReadFromJsonAsync<JsonElement>(jsonOptions);
+                var element = await res.Content.ReadFromJsonAsync<JsonElement>(jsonOptions, cancellationToken);
                 return ApiResult<T>.Success(map(element), (int)res.StatusCode);
             }
             catch (Exception ex)
@@ -739,9 +798,6 @@ namespace Amatsukaze.Shared
             }
             return body;
         }
-
-        private Task<ApiResult<T>> PostJsonAsync<T>(string url, object payload, Func<JsonElement, T> map, CancellationToken cancellationToken)
-            => PostJsonAsync(url, payload, map);
 
         private async Task<ApiResult<T>> PutJsonAsync<T>(string url, object payload, Func<JsonElement, T> map)
         {
