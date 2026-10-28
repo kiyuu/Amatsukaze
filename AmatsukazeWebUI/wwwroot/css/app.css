@@ -2066,3 +2066,291 @@ code {
         padding-right: 2px;
     }
 }
+
+.source-recovery-dialog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: var(--backdrop);
+}
+
+.source-recovery-dialog,
+.source-recovery-waiting-panel {
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-surface);
+    color: var(--text);
+    box-shadow: var(--shadow-lg);
+}
+
+.source-recovery-dialog {
+    width: min(500px, calc(100vw - 2rem));
+    max-height: calc(100vh - 2rem);
+    overflow-y: auto;
+    padding: 1.25rem;
+}
+
+.source-recovery-dialog-heading,
+.source-recovery-waiting-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.source-recovery-dialog-heading h2,
+.source-recovery-waiting-heading h2 {
+    margin: 0;
+    color: var(--text);
+    font-size: 1.2rem;
+    font-weight: 600;
+}
+
+.source-recovery-close {
+    flex: 0 0 auto;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 1.35rem;
+    line-height: 1;
+    padding: 0.4rem 0.55rem;
+    cursor: pointer;
+}
+
+.source-recovery-close:hover,
+.source-recovery-close:focus-visible {
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.source-recovery-dialog-copy {
+    margin: 0.75rem 0 1rem;
+    color: var(--muted);
+}
+
+.source-recovery-file {
+    display: grid;
+    gap: 0.25rem;
+    margin: 0 0 0.8rem;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--bg-surface) 88%, var(--accent));
+}
+
+.source-recovery-label {
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
+.source-recovery-file code {
+    overflow-wrap: anywhere;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.88rem;
+}
+
+.source-recovery-error {
+    margin: 0 0 0.9rem;
+    color: var(--muted);
+    font-size: 0.88rem;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.source-recovery-choice {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    width: 100%;
+    margin-top: 0.65rem;
+    padding: 0.8rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.source-recovery-choice:hover {
+    background: color-mix(in srgb, var(--bg-surface) 88%, var(--accent));
+}
+
+.source-recovery-choice-normal {
+    border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+    background: color-mix(in srgb, var(--bg-surface) 84%, var(--accent));
+}
+
+.source-recovery-choice-force {
+    border-color: color-mix(in srgb, var(--warning) 65%, var(--border));
+}
+
+.source-recovery-choice-force .source-recovery-choice-icon {
+    background: var(--update-warning-bg);
+    color: var(--update-warning-text);
+}
+
+.source-recovery-choice-icon {
+    display: grid;
+    flex: 0 0 2rem;
+    width: 2rem;
+    height: 2rem;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-size: 1.1rem;
+}
+
+.source-recovery-choice-copy {
+    display: grid;
+    flex: 1;
+    min-width: 0;
+    gap: 0.15rem;
+}
+
+.source-recovery-choice-title {
+    font-weight: 600;
+}
+
+.source-recovery-choice-detail,
+.source-recovery-caption {
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.source-recovery-choice-arrow {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-size: 1.35rem;
+    line-height: 1;
+}
+
+.source-recovery-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.6rem;
+    margin-top: 1rem;
+}
+
+.source-recovery-button {
+    min-height: 2.45rem;
+    padding: 0.5rem 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.source-recovery-button:hover,
+.source-recovery-button:focus-visible {
+    background: color-mix(in srgb, var(--bg-surface) 88%, var(--accent));
+}
+
+.source-recovery-button-quiet {
+    border-color: transparent;
+    background: transparent;
+    color: var(--muted);
+}
+
+.source-recovery-waiting-panel {
+    width: min(500px, calc(100% - 2rem));
+    margin: 2rem auto;
+    padding: 1.25rem;
+}
+
+.source-recovery-waiting-scroll {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+}
+
+.source-recovery-waiting-heading {
+    justify-content: flex-start;
+}
+
+.source-recovery-waiting-heading h2 {
+    margin-bottom: 0.25rem;
+}
+
+.source-recovery-waiting-icon {
+    display: grid;
+    flex: 0 0 2.4rem;
+    width: 2.4rem;
+    height: 2.4rem;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-size: 1.2rem;
+}
+
+.source-recovery-waiting-title {
+    margin: 0;
+    font-weight: 600;
+}
+
+.source-recovery-caption {
+    margin: 0.1rem 0 0;
+}
+
+.source-recovery-waiting-copy {
+    margin: 1rem 0 0;
+    color: var(--muted);
+}
+
+.source-recovery-notice {
+    margin: 0.8rem 0 0;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid color-mix(in srgb, var(--update-warning-text) 35%, transparent);
+    border-radius: var(--radius-sm);
+    background: var(--update-warning-bg);
+    color: var(--update-warning-text);
+    font-size: 0.82rem;
+}
+
+.source-recovery-focus-sentinel {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: 0;
+    appearance: none;
+    background: transparent;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+.source-recovery-dialog button:focus-visible,
+.source-recovery-waiting-panel button:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+@media (max-width: 480px) {
+    .source-recovery-dialog,
+    .source-recovery-waiting-panel {
+        padding: 1rem;
+    }
+
+    .source-recovery-dialog {
+        width: calc(100vw - 1rem);
+    }
+
+    .source-recovery-waiting-panel {
+        width: calc(100% - 1rem);
+    }
+}
