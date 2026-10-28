@@ -913,6 +913,10 @@ tstring ConfigWrapper::getResumeDir() const {
     return conf.resumeDir;
 }
 
+tstring ConfigWrapper::getResumeDatPath() const {
+    return conf.resumeDatPath;
+}
+
 tstring ConfigWrapper::getSrcFilePath() const {
     return conf.srcFilePath;
 }
