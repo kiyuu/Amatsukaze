@@ -4190,7 +4190,12 @@ namespace Amatsukaze.Server
 
         internal void ForceStartItem(QueueItem item)
         {
-            workerPool.ForceStart(item);
+            ForceStartItem(item, null);
+        }
+
+        internal void ForceStartItem(QueueItem item, Action onAccepted)
+        {
+            workerPool.ForceStart(item, onAccepted);
         }
 
         // 新しいサービスを登録
