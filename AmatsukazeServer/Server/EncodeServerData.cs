@@ -1847,6 +1847,7 @@ namespace Amatsukaze.Server
         ForceStart, // アイテムを強制的に開始
         RemoveSourceFile, // ソースTSを削除（通常or自動追加の完了した項目のみ有効）
         Move,       // リスト上で移動
+        ResetStateAndForceStart, // 完了項目をリセットして強制開始
     }
 
     [DataContract]
@@ -1868,6 +1869,8 @@ namespace Amatsukaze.Server
         public int Position { get; set; }
         [DataMember]
         public string RequestId { get; set; }
+        [DataMember]
+        public DateTime? ExpectedEncodeStart { get; set; }
     }
 
     [DataContract]
