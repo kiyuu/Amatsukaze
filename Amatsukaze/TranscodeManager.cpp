@@ -9,6 +9,8 @@
 #include "TranscodeManager.h"
 #include "rgy_util.h"
 #include "rgy_thread_affinity.h"
+#include <algorithm>
+#include <atomic>
 #include <thread>
 #include <condition_variable>
 #include <mutex>
@@ -21,9 +23,16 @@
 #include "Subtitle.h"
 #include "WaveWriter.h"
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include "Mpeg2PartialEncode.h"
 #include "CaptionPgs.h"
 #include <filesystem>
+#include <type_traits>
+#include <array>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -43,7 +52,179 @@ struct WhisperAudioEntry {
     int dualMonoChannel; // -1: original stereo, 0/1: dual mono channel selection
 };
 
-constexpr int RESUME_MANIFEST_VERSION = 4;
+constexpr int RESUME_MANIFEST_VERSION = 5; // --resume-dirとResume.datで共有する形式番号
+// 前回の解析結果を再利用できるように保存する。
+constexpr int64_t MAX_RESUME_DAT_PAYLOAD_SIZE = 64LL * 1024 * 1024;
+constexpr uint32_t MAX_RESUME_DAT_LOGO_COUNT = 4096;
+constexpr uint32_t MAX_RESUME_DAT_VIDEO_COUNT = 4096;
+constexpr uint32_t MAX_RESUME_DAT_LOGO_TABLE_COUNT =
+    MAX_RESUME_DAT_LOGO_COUNT * 2 + MAX_RESUME_DAT_VIDEO_COUNT;
+constexpr uint32_t MAX_RESUME_DAT_STRING_SIZE = 1024 * 1024;
+constexpr int64_t RESUME_DAT_VIDEO_RECORD_MIN_SIZE = sizeof(int32_t) * 2 + sizeof(uint32_t) + sizeof(uint64_t);
+
+struct ResumeDatLogoEntry {
+    tstring filename;
+    std::array<uint8_t, 32> sha256 = {};
+};
+
+struct ResumeDatScanRange {
+    int32_t start = 0;
+    int32_t endExclusive = 0;
+};
+
+struct ResumeDatVideoInfo {
+    int numFrames = 0;
+    int32_t selectedLogoIndex = -1;
+    std::vector<ResumeDatScanRange> scanRanges;
+    std::vector<uint8_t> logoFrameBytes;
+    tstring logoPath;
+};
+
+struct ResumeDatInfo {
+    int64_t srcFileSize = 0;
+    int64_t srcWriteTime = 0;
+    int requestedServiceId = -1;
+    bool captionsParsed = false;
+    bool tsreplace = false;
+    bool chapter = false;
+    bool pmtCut = false;
+    double pmtCutSideRate[2] = {};
+    std::vector<ResumeDatLogoEntry> logoTable;
+    std::vector<uint32_t> detectionLogoIndices;
+    std::vector<uint32_t> eraseLogoIndices;
+    bool ignoreNoLogo = false;
+    bool noLogoInCM = false;
+    bool noDelogo = false;
+    bool looseLogoDetection = false;
+    int autoLogoDetect = 0;
+    int autoLogoDetectSearchFrames = 0;
+    int autoLogoDetectDivX = 0;
+    int autoLogoDetectDivY = 0;
+    int autoLogoDetectBlockSize = 0;
+    int autoLogoDetectThreshold = 0;
+    int autoLogoDetectMarginX = 0;
+    int autoLogoDetectMarginY = 0;
+    int serviceId = -1;
+    int64_t numTotalPackets = 0;
+    int64_t numScramblePackets = 0;
+    int64_t totalIntVideoSize = 0;
+    int64_t splitterSrcFileSize = 0;
+    int noDrcsMapCount = 0;
+    std::vector<ResumeDatVideoInfo> videos;
+};
+
+static bool readUtf8CodePoint(const std::string& value, size_t& offset, uint32_t& codePoint) {
+    if (offset >= value.size()) return false;
+    const auto first = static_cast<uint8_t>(value[offset++]);
+    if (first < 0x80) {
+        codePoint = first;
+    } else if (first >= 0xC2 && first <= 0xDF) {
+        if (offset >= value.size()) return false;
+        const auto second = static_cast<uint8_t>(value[offset++]);
+        if ((second & 0xC0) != 0x80) return false;
+        codePoint = ((first & 0x1F) << 6) | (second & 0x3F);
+    } else if (first >= 0xE0 && first <= 0xEF) {
+        if (value.size() - offset < 2) return false;
+        const auto second = static_cast<uint8_t>(value[offset++]);
+        const auto third = static_cast<uint8_t>(value[offset++]);
+        if ((second & 0xC0) != 0x80 || (third & 0xC0) != 0x80
+            || (first == 0xE0 && second < 0xA0) || (first == 0xED && second >= 0xA0)) return false;
+        codePoint = ((first & 0x0F) << 12) | ((second & 0x3F) << 6) | (third & 0x3F);
+    } else if (first >= 0xF0 && first <= 0xF4) {
+        if (value.size() - offset < 3) return false;
+        const auto second = static_cast<uint8_t>(value[offset++]);
+        const auto third = static_cast<uint8_t>(value[offset++]);
+        const auto fourth = static_cast<uint8_t>(value[offset++]);
+        if ((second & 0xC0) != 0x80 || (third & 0xC0) != 0x80 || (fourth & 0xC0) != 0x80
+            || (first == 0xF0 && second < 0x90) || (first == 0xF4 && second >= 0x90)) return false;
+        codePoint = ((first & 0x07) << 18) | ((second & 0x3F) << 12)
+            | ((third & 0x3F) << 6) | (fourth & 0x3F);
+    } else {
+        return false;
+    }
+    return codePoint != 0 && codePoint <= 0x10FFFF
+        && !(codePoint >= 0xD800 && codePoint <= 0xDFFF);
+}
+
+static void appendUtf8CodePoint(std::string& output, const uint32_t codePoint) {
+    if (codePoint <= 0x7F) {
+        output.push_back(static_cast<char>(codePoint));
+    } else if (codePoint <= 0x7FF) {
+        output.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    } else if (codePoint <= 0xFFFF) {
+        output.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    } else {
+        output.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+}
+
+static tstring resumeDatUtf8ToTString(const std::string& utf8) {
+    tstring output;
+    size_t offset = 0;
+    while (offset < utf8.size()) {
+        uint32_t codePoint = 0;
+        if (!readUtf8CodePoint(utf8, offset, codePoint)) {
+            THROW(FormatException, "Resume.datのUTF-8文字列が不正です");
+        }
+#ifdef _MSC_VER
+        if (codePoint <= 0xFFFF) {
+            output.push_back(static_cast<tchar>(codePoint));
+        } else {
+            const uint32_t value = codePoint - 0x10000;
+            output.push_back(static_cast<tchar>(0xD800 + (value >> 10)));
+            output.push_back(static_cast<tchar>(0xDC00 + (value & 0x3FF)));
+        }
+#else
+        appendUtf8CodePoint(output, codePoint);
+#endif
+    }
+    return output;
+}
+
+static std::string resumeDatTStringToUtf8(const tstring& value) {
+#ifdef _MSC_VER
+    std::string output;
+    for (size_t index = 0; index < value.size(); index++) {
+        const uint32_t first = static_cast<uint16_t>(value[index]);
+        if (first == 0) {
+            THROW(FormatException, "Resume.datの文字列にNULが含まれています");
+        }
+        uint32_t codePoint = first;
+        if (first >= 0xD800 && first <= 0xDBFF) {
+            if (++index >= value.size()) {
+                THROW(FormatException, "Resume.datのUTF-16文字列が不正です");
+            }
+            const uint32_t second = static_cast<uint16_t>(value[index]);
+            if (second < 0xDC00 || second > 0xDFFF) {
+                THROW(FormatException, "Resume.datのUTF-16文字列が不正です");
+            }
+            codePoint = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
+        } else if (first >= 0xDC00 && first <= 0xDFFF) {
+            THROW(FormatException, "Resume.datのUTF-16文字列が不正です");
+        }
+        appendUtf8CodePoint(output, codePoint);
+    }
+    return output;
+#else
+    const std::string output(value.begin(), value.end());
+    (void)resumeDatUtf8ToTString(output); // Reject malformed UTF-8 and embedded NUL.
+    return output;
+#endif
+}
+
+static bool isSafeResumeDatLogoFilename(const tstring& filename) {
+    return !filename.empty() && filename != _T(".") && filename != _T("..")
+        && filename.find(static_cast<tchar>(0)) == tstring::npos
+        && filename.find(_T('/')) == tstring::npos
+        && filename.find(static_cast<tchar>(92)) == tstring::npos
+        && filename.find(_T(':')) == tstring::npos;
+}
 
 struct ResumeVideoInfo {
     int numFrames;
@@ -413,6 +594,676 @@ static ResumeInfo readResumeManifest(const tstring& path) {
     return info;
 }
 
+static bool convertUnixTimestampToFileTime(
+    const int64_t unixSeconds,
+    const int64_t nanoseconds,
+    int64_t& fileTimeTicks) {
+    constexpr int64_t TICKS_PER_SECOND = 10000000LL;
+    constexpr int64_t UNIX_TO_FILETIME_TICKS = 116444736000000000LL;
+    if (nanoseconds < 0 || nanoseconds >= 1000000000LL) return false;
+    const int64_t maxValue = (std::numeric_limits<int64_t>::max)();
+    const int64_t minValue = (std::numeric_limits<int64_t>::min)();
+    if (unixSeconds > maxValue / TICKS_PER_SECOND
+        || unixSeconds < minValue / TICKS_PER_SECOND) {
+        return false;
+    }
+    int64_t ticks = unixSeconds * TICKS_PER_SECOND;
+    const int64_t fractionalTicks = nanoseconds / 100;
+    if (ticks > maxValue - fractionalTicks) return false;
+    ticks += fractionalTicks;
+    if (ticks < -UNIX_TO_FILETIME_TICKS
+        || ticks > maxValue - UNIX_TO_FILETIME_TICKS) return false;
+    fileTimeTicks = ticks + UNIX_TO_FILETIME_TICKS;
+    return true;
+}
+
+static int64_t getResumeDatFileTime(const tstring& path) {
+#ifdef _WIN32
+    HANDLE fileHandle = CreateFileW(
+        path.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (fileHandle == INVALID_HANDLE_VALUE) {
+        THROWF(IOException, "入力ファイルの更新時刻を取得できません: %s", path.c_str());
+    }
+    struct FileHandleGuard {
+        HANDLE handle;
+        ~FileHandleGuard() { CloseHandle(handle); }
+    } fileHandleGuard{ fileHandle };
+
+    FILETIME lastWriteTime = {};
+    if (!GetFileTime(fileHandle, nullptr, nullptr, &lastWriteTime)) {
+        THROWF(IOException, "入力ファイルの更新時刻を取得できません: %s", path.c_str());
+    }
+    const uint64_t ticks = (static_cast<uint64_t>(lastWriteTime.dwHighDateTime) << 32)
+        | lastWriteTime.dwLowDateTime;
+    if (ticks > static_cast<uint64_t>((std::numeric_limits<int64_t>::max)())) {
+        THROW(FormatException, "入力ファイルの更新時刻がFILETIMEの範囲外です");
+    }
+    return static_cast<int64_t>(ticks);
+#else
+    struct stat attributes = {};
+    if (stat(std::filesystem::path(path).c_str(), &attributes) != 0) {
+        THROWF(IOException, "入力ファイルの更新時刻を取得できません: %s", path.c_str());
+    }
+    int64_t fileTimeTicks = 0;
+    if (!convertUnixTimestampToFileTime(
+        static_cast<int64_t>(attributes.st_mtim.tv_sec),
+        static_cast<int64_t>(attributes.st_mtim.tv_nsec),
+        fileTimeTicks)) {
+        THROW(FormatException, "入力ファイルの更新時刻をFILETIMEへ変換できません");
+    }
+    return fileTimeTicks;
+#endif
+}
+template<typename T>
+static void writeResumeDatValue(const File& file, const T value) {
+    static_assert(std::is_integral<T>::value || std::is_floating_point<T>::value,
+        "Resume.dat fields must be numeric");
+    static_assert(sizeof(T) <= sizeof(uint64_t), "Resume.dat numeric field is too wide");
+    uint64_t bits = 0;
+    if constexpr (std::is_floating_point<T>::value) {
+        static_assert(std::is_same<T, double>::value && sizeof(double) == sizeof(uint64_t)
+            && std::numeric_limits<double>::is_iec559, "Resume.dat requires IEEE754 binary64");
+        if (!std::isfinite(value)) {
+            THROW(FormatException, "Resume.datの浮動小数点値が有限値ではありません");
+        }
+        std::memcpy(&bits, &value, sizeof(value));
+    } else {
+        using Unsigned = typename std::make_unsigned<T>::type;
+        bits = static_cast<uint64_t>(static_cast<Unsigned>(value));
+    }
+    std::array<uint8_t, sizeof(T)> bytes = {};
+    for (size_t index = 0; index < bytes.size(); index++) {
+        bytes[index] = static_cast<uint8_t>((bits >> (index * 8)) & 0xFF);
+    }
+    file.write(MemoryChunk(bytes.data(), bytes.size()));
+}
+
+class ResumeDatReader {
+public:
+    ResumeDatReader(const File& file, const int64_t limit) : file_(file), limit_(limit) {
+        if (limit_ < file_.pos() || limit_ > file_.size()) {
+            THROW(FormatException, "Resume.datの読み取り範囲が不正です");
+        }
+    }
+
+    size_t read(MemoryChunk chunk) const {
+        const int64_t remaining = limit_ - file_.pos();
+        if (remaining < 0 || static_cast<uint64_t>(chunk.length) > static_cast<uint64_t>(remaining)) {
+            THROW(FormatException, "Resume.datの読み取り範囲を超えました");
+        }
+        const size_t bytesRead = file_.read(chunk);
+        if (bytesRead != chunk.length) {
+            THROW(FormatException, "Resume.datが途中で終わっています");
+        }
+        return bytesRead;
+    }
+
+    template<typename T>
+    T readValue() const {
+        static_assert(std::is_integral<T>::value || std::is_floating_point<T>::value,
+            "Resume.dat fields must be numeric");
+        static_assert(sizeof(T) <= sizeof(uint64_t), "Resume.dat numeric field is too wide");
+        std::array<uint8_t, sizeof(T)> bytes = {};
+        read(MemoryChunk(bytes.data(), bytes.size()));
+        uint64_t bits = 0;
+        for (size_t index = 0; index < bytes.size(); index++) {
+            bits |= static_cast<uint64_t>(bytes[index]) << (index * 8);
+        }
+        if constexpr (std::is_floating_point<T>::value) {
+            static_assert(std::is_same<T, double>::value && sizeof(double) == sizeof(uint64_t)
+                && std::numeric_limits<double>::is_iec559, "Resume.dat requires IEEE754 binary64");
+            T value = 0;
+            std::memcpy(&value, &bits, sizeof(value));
+            if (!std::isfinite(value)) {
+                THROW(FormatException, "Resume.datの浮動小数点値が有限値ではありません");
+            }
+            return value;
+        } else {
+            using Unsigned = typename std::make_unsigned<T>::type;
+            const Unsigned raw = static_cast<Unsigned>(bits);
+            if constexpr (std::is_signed<T>::value) {
+                const Unsigned signMask = static_cast<Unsigned>(Unsigned(1) << (sizeof(T) * 8 - 1));
+                if ((raw & signMask) != 0) {
+                    const Unsigned inverted = static_cast<Unsigned>(~raw);
+                    return static_cast<T>(-1 - static_cast<T>(inverted));
+                }
+            }
+            return static_cast<T>(raw);
+        }
+    }
+
+    int64_t pos() const { return file_.pos(); }
+    int64_t size() const { return limit_; }
+
+private:
+    const File& file_;
+    int64_t limit_;
+};
+
+static int64_t getResumeDatRemainingBytes(const ResumeDatReader& reader) {
+    const int64_t remaining = reader.size() - reader.pos();
+    if (remaining < 0) {
+        THROW(FormatException, "Resume.datの読み取り位置が不正です");
+    }
+    return remaining;
+}
+
+static bool readResumeDatBool(const ResumeDatReader& reader) {
+    const uint8_t value = reader.readValue<uint8_t>();
+    if (value > 1) {
+        THROW(FormatException, "Resume.datの真偽値が不正です");
+    }
+    return value != 0;
+}
+
+static tstring readResumeDatTString(const ResumeDatReader& reader) {
+    const uint32_t byteCount = reader.readValue<uint32_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (byteCount > MAX_RESUME_DAT_STRING_SIZE || static_cast<uint64_t>(byteCount) > static_cast<uint64_t>(remaining)) {
+        THROW(FormatException, "Resume.datのUTF-8文字列長が不正です");
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(byteCount));
+    if (!bytes.empty()) reader.read(MemoryChunk(bytes.data(), bytes.size()));
+    return resumeDatUtf8ToTString(std::string(bytes.begin(), bytes.end()));
+}
+
+static void writeResumeDatTString(const File& file, const tstring& value) {
+    const std::string utf8 = resumeDatTStringToUtf8(value);
+    if (utf8.size() > static_cast<size_t>(MAX_RESUME_DAT_STRING_SIZE)) {
+        THROW(FormatException, "Resume.datのUTF-8文字列長が上限を超えています");
+    }
+    writeResumeDatValue(file, static_cast<uint32_t>(utf8.size()));
+    if (!utf8.empty()) {
+        file.write(MemoryChunk(reinterpret_cast<uint8_t*>(const_cast<char*>(utf8.data())), utf8.size()));
+    }
+}
+
+static bool resumeDatPathEquals(const tstring& left, const tstring& right, const bool caseInsensitive);
+
+static std::vector<ResumeDatLogoEntry> readResumeDatLogoTable(const ResumeDatReader& reader) {
+    const uint32_t count = reader.readValue<uint32_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    constexpr int64_t MIN_LOGO_TABLE_ENTRY_SIZE = sizeof(uint32_t) + 1 + 32;
+    if (count > MAX_RESUME_DAT_LOGO_TABLE_COUNT
+        || count > static_cast<uint64_t>(remaining / MIN_LOGO_TABLE_ENTRY_SIZE)) {
+        THROW(FormatException, "Resume.datのロゴテーブル数が不正です");
+    }
+    std::vector<ResumeDatLogoEntry> entries;
+    entries.reserve(static_cast<size_t>(count));
+    for (uint32_t index = 0; index < count; index++) {
+        ResumeDatLogoEntry entry;
+        entry.filename = readResumeDatTString(reader);
+        if (!isSafeResumeDatLogoFilename(entry.filename)) {
+            THROW(FormatException, "Resume.datのロゴbasenameが不正です");
+        }
+        for (const auto& previous : entries) {
+            if (resumeDatPathEquals(entry.filename, previous.filename, true)) {
+                THROW(FormatException, "Resume.datのロゴbasenameが重複しています");
+            }
+        }
+        reader.read(MemoryChunk(entry.sha256.data(), entry.sha256.size()));
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+static void writeResumeDatLogoTable(const File& file, const std::vector<ResumeDatLogoEntry>& entries) {
+    if (entries.size() > static_cast<size_t>(MAX_RESUME_DAT_LOGO_TABLE_COUNT)) {
+        THROW(FormatException, "Resume.datのロゴテーブル数が上限を超えています");
+    }
+    writeResumeDatValue(file, static_cast<uint32_t>(entries.size()));
+    for (size_t index = 0; index < entries.size(); index++) {
+        const auto& entry = entries[index];
+        if (!isSafeResumeDatLogoFilename(entry.filename)) {
+            THROW(FormatException, "Resume.datに保存するロゴbasenameが不正です");
+        }
+        for (size_t previous = 0; previous < index; previous++) {
+            if (resumeDatPathEquals(entry.filename, entries[previous].filename, true)) {
+                THROW(FormatException, "Resume.datに保存するロゴbasenameが重複しています");
+            }
+        }
+        writeResumeDatTString(file, entry.filename);
+        file.write(MemoryChunk(const_cast<uint8_t*>(entry.sha256.data()), entry.sha256.size()));
+    }
+}
+
+static std::vector<uint32_t> readResumeDatLogoIndices(
+    const ResumeDatReader& reader, const size_t logoTableSize, const TCHAR* const fieldName) {
+    const uint32_t count = reader.readValue<uint32_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (count > MAX_RESUME_DAT_LOGO_COUNT
+        || count > static_cast<uint64_t>(remaining / static_cast<int64_t>(sizeof(uint32_t)))) {
+        THROWF(FormatException, "Resume.datの%sロゴ数が不正です", fieldName);
+    }
+    std::vector<uint32_t> indices;
+    indices.reserve(static_cast<size_t>(count));
+    for (uint32_t offset = 0; offset < count; offset++) {
+        const uint32_t index = reader.readValue<uint32_t>();
+        if (index >= logoTableSize || std::find(indices.begin(), indices.end(), index) != indices.end()) {
+            THROWF(FormatException, "Resume.datの%sロゴindexが不正です", fieldName);
+        }
+        indices.push_back(index);
+    }
+    return indices;
+}
+
+static void writeResumeDatLogoIndices(
+    const File& file, const std::vector<uint32_t>& indices, const size_t logoTableSize, const TCHAR* const fieldName) {
+    if (indices.size() > static_cast<size_t>(MAX_RESUME_DAT_LOGO_COUNT)) {
+        THROWF(FormatException, "Resume.datに保存する%sロゴ数が上限を超えています", fieldName);
+    }
+    writeResumeDatValue(file, static_cast<uint32_t>(indices.size()));
+    for (size_t offset = 0; offset < indices.size(); offset++) {
+        const uint32_t index = indices[offset];
+        if (index >= logoTableSize
+            || std::find(indices.begin(), indices.begin() + offset, index) != indices.begin() + offset) {
+            THROWF(FormatException, "Resume.datに保存する%sロゴindexが不正です", fieldName);
+        }
+        writeResumeDatValue(file, index);
+    }
+}
+
+static std::vector<ResumeDatScanRange> readResumeDatScanRanges(
+    const ResumeDatReader& reader, const int32_t numFrames, const int32_t selectedLogoIndex) {
+    const uint32_t count = reader.readValue<uint32_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (count > static_cast<uint32_t>(numFrames)
+        || count > static_cast<uint64_t>(remaining / (sizeof(int32_t) * 2))
+        || (selectedLogoIndex < 0 && count != 0)) {
+        THROW(FormatException, "Resume.datのロゴ走査範囲数が不正です");
+    }
+    std::vector<ResumeDatScanRange> ranges;
+    ranges.reserve(static_cast<size_t>(count));
+    for (uint32_t index = 0; index < count; index++) {
+        ResumeDatScanRange range;
+        range.start = reader.readValue<int32_t>();
+        range.endExclusive = reader.readValue<int32_t>();
+        if (range.start < 0 || range.start >= range.endExclusive || range.endExclusive > numFrames
+            || (!ranges.empty() && range.start < ranges.back().endExclusive)) {
+            THROW(FormatException, "Resume.datのロゴ走査範囲が不正または重複しています");
+        }
+        ranges.push_back(range);
+    }
+    return ranges;
+}
+
+static void writeResumeDatScanRanges(
+    const File& file, const std::vector<ResumeDatScanRange>& ranges,
+    const int32_t numFrames, const int32_t selectedLogoIndex) {
+    if (ranges.size() > static_cast<size_t>(numFrames)
+        || (selectedLogoIndex < 0 && !ranges.empty())) {
+        THROW(FormatException, "Resume.datに保存するロゴ走査範囲数が不正です");
+    }
+    writeResumeDatValue(file, static_cast<uint32_t>(ranges.size()));
+    for (size_t index = 0; index < ranges.size(); index++) {
+        const auto& range = ranges[index];
+        if (range.start < 0 || range.start >= range.endExclusive || range.endExclusive > numFrames
+            || (index > 0 && range.start < ranges[index - 1].endExclusive)) {
+            THROW(FormatException, "Resume.datに保存するロゴ走査範囲が不正または重複しています");
+        }
+        writeResumeDatValue(file, range.start);
+        writeResumeDatValue(file, range.endExclusive);
+    }
+}
+
+static std::vector<uint8_t> readResumeDatLogoFrameBytes(const ResumeDatReader& reader) {
+    const uint64_t byteCount = reader.readValue<uint64_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (byteCount > static_cast<uint64_t>(MAX_RESUME_DAT_PAYLOAD_SIZE)
+        || byteCount > static_cast<uint64_t>(remaining)) {
+        THROW(FormatException, "Resume.datのLogoFrameサイズが不正です");
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(byteCount));
+    if (!bytes.empty()) reader.read(MemoryChunk(bytes.data(), bytes.size()));
+    return bytes;
+}
+
+static void writeResumeDatLogoFrameBytes(const File& file, const std::vector<uint8_t>& bytes) {
+    if (bytes.size() > static_cast<size_t>(MAX_RESUME_DAT_PAYLOAD_SIZE)) {
+        THROW(FormatException, "Resume.datに保存するLogoFrameサイズが上限を超えています");
+    }
+    writeResumeDatValue(file, static_cast<uint64_t>(bytes.size()));
+    if (!bytes.empty()) {
+        file.write(MemoryChunk(const_cast<uint8_t*>(bytes.data()), bytes.size()));
+    }
+}
+
+static ResumeDatInfo readResumeDatHeader(const ResumeDatReader& reader) {
+    const int32_t version = reader.readValue<int32_t>();
+    if (version != RESUME_MANIFEST_VERSION) {
+        THROWF(FormatException, "Resume.dat形式のバージョンが未対応です: %d", version);
+    }
+
+    ResumeDatInfo info;
+    info.srcFileSize = reader.readValue<int64_t>();
+    info.srcWriteTime = reader.readValue<int64_t>();
+    info.requestedServiceId = reader.readValue<int32_t>();
+    info.serviceId = reader.readValue<int32_t>();
+    info.splitterSrcFileSize = reader.readValue<int64_t>();
+    info.numTotalPackets = reader.readValue<int64_t>();
+    info.numScramblePackets = reader.readValue<int64_t>();
+    info.totalIntVideoSize = reader.readValue<int64_t>();
+
+    info.captionsParsed = readResumeDatBool(reader);
+    info.noDrcsMapCount = reader.readValue<int32_t>();
+    if (info.noDrcsMapCount < 0) {
+        THROW(FormatException, "Resume.datのDRCS未登録数が不正です");
+    }
+    info.tsreplace = readResumeDatBool(reader);
+    info.chapter = readResumeDatBool(reader);
+    info.pmtCut = readResumeDatBool(reader);
+    info.pmtCutSideRate[0] = reader.readValue<double>();
+    info.pmtCutSideRate[1] = reader.readValue<double>();
+
+    info.ignoreNoLogo = readResumeDatBool(reader);
+    info.noLogoInCM = readResumeDatBool(reader);
+    info.noDelogo = readResumeDatBool(reader);
+    info.looseLogoDetection = readResumeDatBool(reader);
+    info.autoLogoDetect = reader.readValue<int32_t>();
+    info.autoLogoDetectSearchFrames = reader.readValue<int32_t>();
+    info.autoLogoDetectDivX = reader.readValue<int32_t>();
+    info.autoLogoDetectDivY = reader.readValue<int32_t>();
+    info.autoLogoDetectBlockSize = reader.readValue<int32_t>();
+    info.autoLogoDetectThreshold = reader.readValue<int32_t>();
+    info.autoLogoDetectMarginX = reader.readValue<int32_t>();
+    info.autoLogoDetectMarginY = reader.readValue<int32_t>();
+
+    info.logoTable = readResumeDatLogoTable(reader);
+    info.detectionLogoIndices = readResumeDatLogoIndices(reader, info.logoTable.size(), _T("検出候補"));
+    info.eraseLogoIndices = readResumeDatLogoIndices(reader, info.logoTable.size(), _T("消去候補"));
+
+    const uint32_t videoCount = reader.readValue<uint32_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (videoCount > MAX_RESUME_DAT_VIDEO_COUNT
+        || videoCount > static_cast<uint64_t>(remaining / RESUME_DAT_VIDEO_RECORD_MIN_SIZE)) {
+        THROW(FormatException, "Resume.datの映像数が不正です");
+    }
+    info.videos.resize(static_cast<size_t>(videoCount));
+    return info;
+}
+
+static ResumeDatInfo readResumeDatManifest(const tstring& path) {
+    File file(path, _T("rb"));
+    const int64_t fileSize = file.size();
+    ResumeDatReader reader(file, fileSize);
+    ResumeDatInfo info = readResumeDatHeader(reader);
+    for (auto& video : info.videos) {
+        video.numFrames = reader.readValue<int32_t>();
+        if (video.numFrames < 0) {
+            THROW(FormatException, "Resume.datのフレーム数が不正です");
+        }
+        video.selectedLogoIndex = reader.readValue<int32_t>();
+        if (video.selectedLogoIndex < -1
+            || (video.selectedLogoIndex >= 0 && static_cast<size_t>(video.selectedLogoIndex) >= info.logoTable.size())) {
+            THROW(FormatException, "Resume.datの選択ロゴindexが不正です");
+        }
+        video.scanRanges = readResumeDatScanRanges(reader, video.numFrames, video.selectedLogoIndex);
+        video.logoFrameBytes = readResumeDatLogoFrameBytes(reader);
+        if ((video.selectedLogoIndex < 0 && !video.logoFrameBytes.empty())
+            || (video.selectedLogoIndex >= 0 && video.logoFrameBytes.empty())) {
+            THROW(FormatException, "Resume.datの選択ロゴとLogoFrameの組み合わせが不正です");
+        }
+    }
+    if (reader.pos() != fileSize || file.size() != fileSize) {
+        THROW(FormatException, "Resume.datに未解釈データがあるか、読み込み中にファイルサイズが変化しました");
+    }
+    return info;
+}
+
+static void writeResumeDatInfo(const File& file, const ResumeDatInfo& info) {
+    static_assert(sizeof(double) == sizeof(uint64_t) && std::numeric_limits<double>::is_iec559,
+        "Resume.dat requires IEEE754 binary64");
+    if (info.videos.size() > static_cast<size_t>(MAX_RESUME_DAT_VIDEO_COUNT)
+        || info.noDrcsMapCount < 0) {
+        THROW(FormatException, "Resume.datの映像数またはDRCS未登録数が不正です");
+    }
+    writeResumeDatValue(file, static_cast<int32_t>(RESUME_MANIFEST_VERSION));
+    writeResumeDatValue(file, info.srcFileSize);
+    writeResumeDatValue(file, info.srcWriteTime);
+    writeResumeDatValue(file, static_cast<int32_t>(info.requestedServiceId));
+    writeResumeDatValue(file, static_cast<int32_t>(info.serviceId));
+    writeResumeDatValue(file, info.splitterSrcFileSize);
+    writeResumeDatValue(file, info.numTotalPackets);
+    writeResumeDatValue(file, info.numScramblePackets);
+    writeResumeDatValue(file, info.totalIntVideoSize);
+
+    writeResumeDatValue(file, static_cast<uint8_t>(info.captionsParsed ? 1 : 0));
+    writeResumeDatValue(file, static_cast<int32_t>(info.noDrcsMapCount));
+    writeResumeDatValue(file, static_cast<uint8_t>(info.tsreplace ? 1 : 0));
+    writeResumeDatValue(file, static_cast<uint8_t>(info.chapter ? 1 : 0));
+    writeResumeDatValue(file, static_cast<uint8_t>(info.pmtCut ? 1 : 0));
+    writeResumeDatValue(file, info.pmtCutSideRate[0]);
+    writeResumeDatValue(file, info.pmtCutSideRate[1]);
+
+    writeResumeDatValue(file, static_cast<uint8_t>(info.ignoreNoLogo ? 1 : 0));
+    writeResumeDatValue(file, static_cast<uint8_t>(info.noLogoInCM ? 1 : 0));
+    writeResumeDatValue(file, static_cast<uint8_t>(info.noDelogo ? 1 : 0));
+    writeResumeDatValue(file, static_cast<uint8_t>(info.looseLogoDetection ? 1 : 0));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetect));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectSearchFrames));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectDivX));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectDivY));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectBlockSize));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectThreshold));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectMarginX));
+    writeResumeDatValue(file, static_cast<int32_t>(info.autoLogoDetectMarginY));
+
+    writeResumeDatLogoTable(file, info.logoTable);
+    writeResumeDatLogoIndices(file, info.detectionLogoIndices, info.logoTable.size(), _T("検出候補"));
+    writeResumeDatLogoIndices(file, info.eraseLogoIndices, info.logoTable.size(), _T("消去候補"));
+    writeResumeDatValue(file, static_cast<uint32_t>(info.videos.size()));
+    for (const auto& video : info.videos) {
+        if (video.numFrames < 0 || video.selectedLogoIndex < -1
+            || (video.selectedLogoIndex >= 0 && static_cast<size_t>(video.selectedLogoIndex) >= info.logoTable.size())) {
+            THROW(FormatException, "Resume.datに保存するフレーム数または選択ロゴindexが不正です");
+        }
+        if ((video.selectedLogoIndex < 0 && !video.logoFrameBytes.empty())
+            || (video.selectedLogoIndex >= 0 && video.logoFrameBytes.empty())) {
+            THROW(FormatException, "Resume.datに保存する選択ロゴとLogoFrameの組み合わせが不正です");
+        }
+        writeResumeDatValue(file, static_cast<int32_t>(video.numFrames));
+        writeResumeDatValue(file, video.selectedLogoIndex);
+        writeResumeDatScanRanges(file, video.scanRanges, video.numFrames, video.selectedLogoIndex);
+        writeResumeDatLogoFrameBytes(file, video.logoFrameBytes);
+    }
+}
+
+static tstring getResumeDatFilename(const tstring& path) {
+    if (path.empty()) return tstring();
+    const auto filename = std::filesystem::path(path).filename().native();
+    if (filename.empty() || filename == _T(".") || filename == _T("..")
+        || filename.find(static_cast<tchar>(0)) != tstring::npos
+        || filename.find(_T('/')) != tstring::npos
+        || filename.find(static_cast<tchar>(92)) != tstring::npos
+        || filename.find(_T(':')) != tstring::npos) {
+        THROW(FormatException, "Resume.datに保存するロゴbasenameが不正です");
+    }
+    return filename;
+}
+
+static std::vector<uint8_t> loadResumeDatLogoFrame(const tstring& path) {
+    if (!File::exists(path)) return {};
+    File input(path, _T("rb"));
+    const int64_t byteCount = input.size();
+    if (byteCount <= 0 || byteCount > MAX_RESUME_DAT_PAYLOAD_SIZE) {
+        THROW(FormatException, "Resume.datに保存するLogoFrameサイズが不正です");
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(byteCount));
+    if (input.read(MemoryChunk(bytes.data(), bytes.size())) != bytes.size()) {
+        THROW(IOException, "Resume.datに保存するLogoFrameを読み込めません");
+    }
+    return bytes;
+}
+
+static void writeResumeDatManifest(
+    const File& file,
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo,
+    const std::vector<std::unique_ptr<CMAnalyze>>& cmanalyze,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    ResumeDatInfo info;
+    const auto pmtCutSideRate = setting.getPmtCutSideRate();
+    const auto srcPath = setting.getSrcFileOriginalPath();
+    info.srcFileSize = srcFileSize;
+    info.srcWriteTime = getResumeDatFileTime(srcPath);
+    info.requestedServiceId = setting.getServiceId();
+    info.captionsParsed = captionsParsed;
+    info.tsreplace = setting.getFormat() == FORMAT_TSREPLACE;
+    info.chapter = setting.isChapterEnabled();
+    info.pmtCut = setting.isPmtCutEnabled();
+    info.pmtCutSideRate[0] = pmtCutSideRate[0];
+    info.pmtCutSideRate[1] = pmtCutSideRate[1];
+    info.ignoreNoLogo = setting.isIgnoreNoLogo();
+    info.noLogoInCM = setting.isNoLogoInCM();
+    info.noDelogo = setting.isNoDelogo();
+    info.looseLogoDetection = setting.isLooseLogoDetection();
+    info.autoLogoDetect = setting.getAutoLogoDetect();
+    info.autoLogoDetectSearchFrames = setting.getAutoLogoDetectSearchFrames();
+    info.autoLogoDetectDivX = setting.getAutoLogoDetectDivX();
+    info.autoLogoDetectDivY = setting.getAutoLogoDetectDivY();
+    info.autoLogoDetectBlockSize = setting.getAutoLogoDetectBlockSize();
+    info.autoLogoDetectThreshold = setting.getAutoLogoDetectThreshold();
+    info.autoLogoDetectMarginX = setting.getAutoLogoDetectMarginX();
+    info.autoLogoDetectMarginY = setting.getAutoLogoDetectMarginY();
+    info.serviceId = serviceId;
+    info.numTotalPackets = numTotalPackets;
+    info.numScramblePackets = numScramblePackets;
+    info.totalIntVideoSize = totalIntVideoSize;
+    info.splitterSrcFileSize = srcFileSize;
+    info.noDrcsMapCount = noDrcsMapCount;
+
+    std::vector<std::vector<tstring>> logoPathsByEntry;
+    auto addLogoEntry = [&](const tstring& path, const tstring& filename,
+        const logo::LogoLoadHash& loadedHash) -> uint32_t {
+        if (!loadedHash.available || !isSafeResumeDatLogoFilename(filename)) {
+            THROW(FormatException, "Resume.datに保存するロゴbasenameまたはLogoData::Load hashが不正です");
+        }
+        for (uint32_t index = 0; index < info.logoTable.size(); index++) {
+            auto& entry = info.logoTable[index];
+            if (!resumeDatPathEquals(entry.filename, filename, true)) continue;
+            if (entry.sha256 != loadedHash.sha256) {
+                THROW(FormatException, "同じロゴbasenameが複数のLogoData::Load内容を参照しています");
+            }
+            auto& paths = logoPathsByEntry[index];
+            if (std::find(paths.begin(), paths.end(), path) == paths.end()) {
+                paths.push_back(path);
+            }
+            return index;
+        }
+        if (info.logoTable.size() >= static_cast<size_t>(MAX_RESUME_DAT_LOGO_TABLE_COUNT)) {
+            THROW(FormatException, "Resume.datのロゴテーブル数が上限を超えています");
+        }
+        ResumeDatLogoEntry entry;
+        entry.filename = filename;
+        entry.sha256 = loadedHash.sha256;
+        info.logoTable.push_back(std::move(entry));
+        logoPathsByEntry.push_back({ path });
+        return static_cast<uint32_t>(info.logoTable.size() - 1);
+    };
+
+    const auto& detectionPaths = setting.getLogoPath();
+    const auto& erasePaths = setting.getEraseLogoPath();
+    const size_t expectedLoadedHashCount = detectionPaths.size() + erasePaths.size();
+    if (cmanalyze.size() != static_cast<size_t>(reformInfo.getNumVideoFile())) {
+        THROW(FormatException, "Resume.datの解析済み映像数が一致しません");
+    }
+    bool haveCandidateHashes = false;
+    for (const auto& cma : cmanalyze) {
+        if (!cma->didAttemptResumeDatLogoAnalysis()) continue;
+        const auto& hashes = cma->getLogoLoadHashes();
+        if (hashes.size() != expectedLoadedHashCount) {
+            THROW(FormatException, "LogoData::Loadでロゴ候補全件のhashを取得できません");
+        }
+        for (const auto& hash : hashes) {
+            if (!hash.available) {
+                THROW(FormatException, "LogoData::LoadのSHA-256を取得できません");
+            }
+        }
+        if (!haveCandidateHashes) {
+            for (size_t index = 0; index < detectionPaths.size(); index++) {
+                const tstring filename = getResumeDatFilename(detectionPaths[index]);
+                const uint32_t tableIndex = addLogoEntry(detectionPaths[index], filename, hashes[index]);
+                info.detectionLogoIndices.push_back(tableIndex);
+            }
+            for (size_t index = 0; index < erasePaths.size(); index++) {
+                const size_t hashIndex = detectionPaths.size() + index;
+                const tstring filename = getResumeDatFilename(erasePaths[index]);
+                const uint32_t tableIndex = addLogoEntry(erasePaths[index], filename, hashes[hashIndex]);
+                info.eraseLogoIndices.push_back(tableIndex);
+            }
+            haveCandidateHashes = true;
+            continue;
+        }
+        for (size_t index = 0; index < detectionPaths.size(); index++) {
+            if (hashes[index].sha256 != info.logoTable[info.detectionLogoIndices[index]].sha256) {
+                THROW(FormatException, "検出候補ロゴが映像間で変化しました");
+            }
+        }
+        for (size_t index = 0; index < erasePaths.size(); index++) {
+            const size_t hashIndex = detectionPaths.size() + index;
+            if (hashes[hashIndex].sha256 != info.logoTable[info.eraseLogoIndices[index]].sha256) {
+                THROW(FormatException, "消去候補ロゴが映像間で変化しました");
+            }
+        }
+    }
+    if (!haveCandidateHashes && expectedLoadedHashCount != 0) {
+        THROW(FormatException, "LogoData::Loadでロゴ候補全件のhashを取得できません");
+    }
+
+    info.videos.reserve(cmanalyze.size());
+    for (int videoFileIndex = 0; videoFileIndex < static_cast<int>(cmanalyze.size()); videoFileIndex++) {
+        const auto& cma = cmanalyze[videoFileIndex];
+        ResumeDatVideoInfo video;
+        const size_t numFrames = reformInfo.getFilterSourceFrames(videoFileIndex).size();
+        if (numFrames > static_cast<size_t>((std::numeric_limits<int32_t>::max)())) {
+            THROW(FormatException, "Resume.datに保存する映像フレーム数が上限を超えています");
+        }
+        video.numFrames = static_cast<int32_t>(numFrames);
+        const tstring selectedLogoFilename = getResumeDatFilename(cma->getLogoPath());
+        if (!selectedLogoFilename.empty()) {
+            const auto& selectedHash = cma->getSelectedLogoLoadHash();
+            video.selectedLogoIndex = static_cast<int32_t>(addLogoEntry(
+                cma->getLogoPath(), selectedLogoFilename, selectedHash));
+            video.logoFrameBytes = loadResumeDatLogoFrame(setting.getTmpLogoFramePath(videoFileIndex));
+            if (video.logoFrameBytes.empty()) {
+                THROW(FormatException, "Resume.datに保存する選択ロゴのLogoFrameがありません");
+            }
+            for (const auto& range : cma->getLogoScanRanges()) {
+                video.scanRanges.push_back(ResumeDatScanRange{ range.first, range.second });
+            }
+        }
+        info.videos.push_back(std::move(video));
+    }
+
+    for (size_t index = 0; index < info.logoTable.size(); index++) {
+        if (logoPathsByEntry[index].empty()) {
+            THROW(FormatException, "Resume.datのロゴhashに対応するファイルpathがありません");
+        }
+        for (const auto& logoPath : logoPathsByEntry[index]) {
+            logo::LogoHeader header;
+            logo::LogoLoadHash currentHash = {};
+            const auto loadedLogo = logo::LogoData::Load(logoPath, &header, &currentHash);
+            (void)loadedLogo;
+            if (!currentHash.available || currentHash.sha256 != info.logoTable[index].sha256) {
+                THROW(FormatException, "LogoData::Load後にロゴファイルが変化しました。Resume.datは更新しません");
+            }
+        }
+    }
+    writeResumeDatInfo(file, info);
+}
+
 static bool validateResumeSetting(const ConfigWrapper& setting, const ResumeInfo& info, tstring& reason) {
     std::vector<tstring> mismatchedFields;
     if (info.srcFileSize != getFileSize(setting.getSrcFilePath())
@@ -522,6 +1373,368 @@ static bool validateResumeFiles(
         }
     }
     return true;
+}
+
+struct ResumeDatLogoFilePath {
+    std::filesystem::path parent;
+    tstring basename;
+};
+
+static bool isResumeDatAsciiDigit(const tchar character) {
+    return character >= _T('0') && character <= _T('9');
+}
+
+static tchar foldResumeDatPathCharacter(const tchar character) {
+    return character >= _T('A') && character <= _T('Z')
+        ? static_cast<tchar>(character + (_T('a') - _T('A'))) : character;
+}
+
+static bool resumeDatPathEquals(const tstring& left, const tstring& right, const bool caseInsensitive) {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); index++) {
+        const tchar leftCharacter = caseInsensitive
+            ? foldResumeDatPathCharacter(left[index]) : left[index];
+        const tchar rightCharacter = caseInsensitive
+            ? foldResumeDatPathCharacter(right[index]) : right[index];
+        if (leftCharacter != rightCharacter) return false;
+    }
+    return true;
+}
+
+static bool resumeDatLogoNamesCollide(const tstring& left, const tstring& right) {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); index++) {
+        const tchar leftCharacter = foldResumeDatPathCharacter(left[index]);
+        const tchar rightCharacter = foldResumeDatPathCharacter(right[index]);
+        if (leftCharacter != rightCharacter) return false;
+    }
+    return true;
+}
+
+static bool resolveResumeDatLogoFilePath(
+    const tstring& path, ResumeDatLogoFilePath& result, tstring& reason) {
+    if (path.empty() || path.find(static_cast<tchar>(0)) != tstring::npos) {
+        reason = _T("ロゴpathが空、またはNULを含んでいます");
+        return false;
+    }
+    result.basename = PathGetFilename(path);
+    if (!isSafeResumeDatLogoFilename(result.basename)) {
+        reason = _T("現在のlogo pathのbasenameが不正です");
+        return false;
+    }
+
+    const std::filesystem::path filePath(path);
+    auto lexicalParent = filePath.parent_path();
+    if (lexicalParent.empty()) lexicalParent = std::filesystem::path(_T("."));
+
+    std::error_code parentError, fileError, rootStatusError, fileStatusError;
+    result.parent = std::filesystem::canonical(lexicalParent, parentError);
+    const auto resolvedFile = std::filesystem::canonical(filePath, fileError);
+    if (parentError || fileError
+        || !std::filesystem::is_directory(result.parent, rootStatusError)
+        || rootStatusError
+        || !std::filesystem::is_regular_file(resolvedFile, fileStatusError)
+        || fileStatusError) {
+        reason = _T("現在のlogo rootまたはfileを実体解決できません");
+        return false;
+    }
+    if (!rgy_path_is_same(resolvedFile.parent_path().native(), result.parent.native())) {
+        reason = _T("現在のlogo fileのcanonical pathがlogo root直下ではありません");
+        return false;
+    }
+    return true;
+}
+
+static bool hasResumeDatAutoLogoName(const tstring& basename, const int serviceId) {
+    const tstring prefix = StringFormat(_T("SID%d-auto-"), serviceId);
+    constexpr size_t AUTO_TIMESTAMP_LENGTH = 15; // YYYYMMDD_HHMMSS
+    constexpr size_t LOGO_EXTENSION_LENGTH = 4;
+    if (basename.size() != prefix.size() + AUTO_TIMESTAMP_LENGTH + LOGO_EXTENSION_LENGTH
+        || basename.compare(0, prefix.size(), prefix) != 0
+        || basename.compare(basename.size() - 4, 4, _T(".lgd")) != 0) {
+        return false;
+    }
+    const size_t timestampStart = prefix.size();
+    for (size_t offset = 0; offset < AUTO_TIMESTAMP_LENGTH; offset++) {
+        const tchar character = basename[timestampStart + offset];
+        if (offset == 8) {
+            if (character != _T('_')) return false;
+        } else if (!isResumeDatAsciiDigit(character)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool rebaseResumeDatLogoPaths(
+    ResumeDatInfo& info,
+    const std::vector<tstring>& currentLogoPaths,
+    tstring& reason) {
+    reason.clear();
+    if (!info.eraseLogoIndices.empty()) {
+        reason = _T("Resume.datは追加ロゴ消し用の複数LogoFrameを保存しないため再利用できません");
+        return false;
+    }
+    if (info.detectionLogoIndices.size() != currentLogoPaths.size()) {
+        reason = _T("保存元と現在のロゴ設定件数が一致しません");
+        return false;
+    }
+    if (info.detectionLogoIndices.empty()) {
+        for (auto& video : info.videos) {
+            if (video.selectedLogoIndex >= 0) {
+                reason = _T("現在のlogo rootがなく、保存済み動画ロゴを解決できません");
+                return false;
+            }
+            video.logoPath.clear();
+        }
+        return true;
+    }
+
+    std::vector<ResumeDatLogoFilePath> currentPaths;
+    currentPaths.reserve(currentLogoPaths.size());
+    for (size_t index = 0; index < currentLogoPaths.size(); index++) {
+        const uint32_t logoIndex = info.detectionLogoIndices[index];
+        if (logoIndex >= info.logoTable.size()) {
+            reason = _T("保存されたロゴ候補indexが不正です");
+            return false;
+        }
+        const auto& savedFilename = info.logoTable[logoIndex].filename;
+        if (!isSafeResumeDatLogoFilename(savedFilename)) {
+            reason = _T("保存されたロゴ設定basenameが不正です");
+            return false;
+        }
+        ResumeDatLogoFilePath currentPath;
+        if (!resolveResumeDatLogoFilePath(currentLogoPaths[index], currentPath, reason)) return false;
+        if (!resumeDatPathEquals(savedFilename, currentPath.basename, false)) {
+            reason = _T("保存元と現在のロゴ設定basenameまたは順序が一致しません");
+            return false;
+        }
+        for (size_t previous = 0; previous < index; previous++) {
+            const auto& previousFilename = info.logoTable[info.detectionLogoIndices[previous]].filename;
+            if (resumeDatLogoNamesCollide(savedFilename, previousFilename)
+                || resumeDatLogoNamesCollide(currentPath.basename, currentPaths[previous].basename)) {
+                reason = _T("ロゴbasenameが衝突して対応付けできません");
+                return false;
+            }
+        }
+        currentPaths.push_back(std::move(currentPath));
+    }
+
+    const auto currentRoot = currentPaths.front().parent;
+    for (const auto& currentPath : currentPaths) {
+        if (!rgy_path_is_same(currentPath.parent.native(), currentRoot.native())) {
+            reason = _T("現在のロゴ設定が複数parentに分かれています");
+            return false;
+        }
+    }
+
+    for (auto& video : info.videos) {
+        if (video.selectedLogoIndex < 0) {
+            video.logoPath.clear();
+            continue;
+        }
+        if (static_cast<size_t>(video.selectedLogoIndex) >= info.logoTable.size()) {
+            reason = _T("保存されたvideo.logo indexが不正です");
+            return false;
+        }
+        const auto& selectedFilename = info.logoTable[video.selectedLogoIndex].filename;
+        if (!isSafeResumeDatLogoFilename(selectedFilename)) {
+            reason = _T("保存されたvideo.logo basenameが不正です");
+            return false;
+        }
+        bool matchedSettingEntry = false;
+        for (const auto& currentPath : currentPaths) {
+            if (resumeDatPathEquals(currentPath.basename, selectedFilename, false)) {
+                matchedSettingEntry = true;
+                break;
+            }
+        }
+        if (!matchedSettingEntry && !hasResumeDatAutoLogoName(selectedFilename, info.serviceId)) {
+            reason = _T("保存されたvideo.logoが設定entryまたは自動生成ロゴではありません");
+            return false;
+        }
+        const auto videoLogoPath = currentRoot / std::filesystem::path(selectedFilename);
+        ResumeDatLogoFilePath resolvedVideoPath;
+        if (!resolveResumeDatLogoFilePath(videoLogoPath.native(), resolvedVideoPath, reason)) return false;
+        video.logoPath = videoLogoPath.native();
+    }
+    return true;
+}
+
+static bool validateResumeDatSettings(
+    const ConfigWrapper& setting,
+    const ResumeDatInfo& info,
+    StreamReformInfo& reformInfo,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    tstring& reason) {
+    std::vector<tstring> mismatchedFields;
+    auto addMismatch = [&](const tchar* field) {
+        mismatchedFields.push_back(field);
+    };
+    const auto srcPath = setting.getSrcFileOriginalPath();
+    if (info.srcFileSize != getFileSize(srcPath)
+        || info.srcWriteTime != getResumeDatFileTime(srcPath)) {
+        addMismatch(_T("入力TS"));
+    }
+    if (info.requestedServiceId != setting.getServiceId()) addMismatch(_T("要求サービスID"));
+    if (info.tsreplace != (setting.getFormat() == FORMAT_TSREPLACE)) addMismatch(_T("TS置換出力"));
+    if (info.looseLogoDetection != setting.isLooseLogoDetection()) addMismatch(_T("ロゴ検出しきい値設定"));
+    if (info.serviceId != serviceId) addMismatch(_T("実サービスID"));
+    if (info.numTotalPackets != numTotalPackets) addMismatch(_T("入力パケット数"));
+    if (info.numScramblePackets != numScramblePackets) addMismatch(_T("スクランブルパケット数"));
+    if (info.totalIntVideoSize != totalIntVideoSize) addMismatch(_T("映像サイズ"));
+    if (info.splitterSrcFileSize != srcFileSize || info.splitterSrcFileSize != info.srcFileSize) {
+        addMismatch(_T("TS解析サイズ"));
+    }
+    if (!mismatchedFields.empty()) {
+        reason = _T("Resume.datと解析条件が一致しません(");
+        for (size_t index = 0; index < mismatchedFields.size(); index++) {
+            if (index > 0) reason += _T(", ");
+            reason += mismatchedFields[index];
+        }
+        reason += _T(")");
+        return false;
+    }
+
+    // Resume.dat stores only the selected logo LogoFrame; erase-logo frames remain unsupported for reuse.
+    if (!info.eraseLogoIndices.empty()) {
+        reason = _T("Resume.datは追加ロゴ消し用の複数LogoFrameを保存しないため再利用できません");
+        return false;
+    }
+    if ((int)info.videos.size() != reformInfo.getNumVideoFile()) {
+        reason = _T("Resume.datの映像数が一致しません");
+        return false;
+    }
+    for (int videoFileIndex = 0; videoFileIndex < reformInfo.getNumVideoFile(); videoFileIndex++) {
+        const auto& video = info.videos[videoFileIndex];
+        const int numFrames = (int)reformInfo.getFilterSourceFrames(videoFileIndex).size();
+        if (video.numFrames != numFrames) {
+            reason = StringFormat(_T("Resume.datのフレーム数が一致しません: %d"), videoFileIndex);
+            return false;
+        }
+        if ((video.selectedLogoIndex < 0 && !video.logoPath.empty())
+            || (video.selectedLogoIndex >= 0 && video.logoPath.empty())) {
+            reason = StringFormat(_T("Resume.datの選択ロゴindexとpathが一致しません: %d"), videoFileIndex);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tryLoadResumeDat(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    ResumeDatInfo& info,
+    StreamReformInfo& reformInfo,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize) {
+    const auto path = setting.getResumeDatPath();
+    if (path.empty()) {
+        return false;
+    }
+    try {
+        if (!File::exists(path)) {
+            ctx.infoF(_T("[Resume.dat再利用] ファイルがないため通常処理へ進みます: %s"), path.c_str());
+            return false;
+        }
+        info = readResumeDatManifest(path);
+        tstring reason;
+        if (!rebaseResumeDatLogoPaths(info, setting.getLogoPath(), reason)) {
+            ctx.warnF(_T("[Resume.dat再利用] %s。通常処理へ戻ります"), reason.c_str());
+            return false;
+        }
+        if (!validateResumeDatSettings(setting, info, reformInfo,
+            serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize,
+            srcFileSize, reason)) {
+            ctx.warnF(_T("[Resume.dat再利用] %s。通常処理へ戻ります"), reason.c_str());
+            return false;
+        }
+        ctx.infoF(_T("[Resume.dat再利用] 候補を読み込みました: %s"), path.c_str());
+        return true;
+    } catch (const Exception& e) {
+        ctx.warnF(_T("[Resume.dat再利用] 読み込みに失敗したため通常処理へ戻ります: %s"), e.message());
+    } catch (const std::exception& e) {
+        ctx.warnF(_T("[Resume.dat再利用] 読み込みに失敗したため通常処理へ戻ります: %s"), char_to_tstring(e.what()));
+    }
+    return false;
+}
+
+static ResumeDatLogoReuseData makeResumeDatLogoReuseData(
+    const ResumeDatInfo& info, const size_t videoFileIndex) {
+    ResumeDatLogoReuseData reuse;
+    reuse.hasCachedCandidateData = true;
+    const auto& video = info.videos.at(videoFileIndex);
+    reuse.hasSelectedLogo = video.selectedLogoIndex >= 0;
+    if (reuse.hasSelectedLogo) {
+        const auto& selected = info.logoTable.at(static_cast<size_t>(video.selectedLogoIndex));
+        reuse.selectedLogoPath = video.logoPath;
+        reuse.selectedLogoHash = selected.sha256;
+        reuse.logoFrameBytes = video.logoFrameBytes;
+        for (const auto& range : video.scanRanges) {
+            reuse.scanRanges.push_back({ range.start, range.endExclusive });
+        }
+    }
+    for (const uint32_t index : info.detectionLogoIndices) {
+        reuse.detectionLogoHashes.push_back(info.logoTable.at(index).sha256);
+    }
+    for (const uint32_t index : info.eraseLogoIndices) {
+        reuse.eraseLogoHashes.push_back(info.logoTable.at(index).sha256);
+    }
+    return reuse;
+}
+
+static void saveResumeDatSidecar(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo,
+    const std::vector<std::unique_ptr<CMAnalyze>>& cmanalyze,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    const auto path = setting.getResumeDatPath();
+    if (path.empty()) {
+        return;
+    }
+    static std::atomic<uint64_t> stageSequence{ 0 };
+    const auto writingPath = StringFormat(_T("%s.%llu.%llu.writing"),
+        path.c_str(),
+        (unsigned long long)GetCurrentProcessId(),
+        (unsigned long long)stageSequence.fetch_add(1));
+    try {
+        {
+            File file(writingPath, _T("wb"));
+            writeResumeDatManifest(file, setting, reformInfo, cmanalyze,
+                serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize,
+                srcFileSize, noDrcsMapCount, captionsParsed);
+            file.flush();
+        }
+        readResumeDatManifest(writingPath);
+#ifdef _WIN32
+        if (!MoveFileEx(writingPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            THROWF(IOException, "Resume.datを置き換えられませんでした (error=%d)", (int)GetLastError());
+        }
+#else
+        std::filesystem::rename(writingPath, path);
+#endif
+        ctx.infoF(_T("[Resume.dat再利用] 解析結果を保存しました: %s"), path.c_str());
+    } catch (const Exception& e) {
+        rgy_file_remove(writingPath.c_str());
+        ctx.warnF(_T("[Resume.dat再利用] 保存に失敗しました: %s"), e.message());
+    } catch (const std::exception& e) {
+        rgy_file_remove(writingPath.c_str());
+        ctx.warnF(_T("[Resume.dat再利用] 保存に失敗しました: %s"), char_to_tstring(e.what()));
+    }
 }
 
 static bool tryLoadResume(
@@ -936,6 +2149,212 @@ private:
 
 } // namespace
 
+static ResumeDatInfo makeResumeDatSampleForTest() {
+    ResumeDatInfo info;
+    info.srcFileSize = 0x0102030405060708LL;
+    info.srcWriteTime = 132539328000000000LL;
+    info.requestedServiceId = 0x0A0B0C0D;
+    info.captionsParsed = true;
+    info.tsreplace = false;
+    info.chapter = true;
+    info.pmtCut = false;
+    info.pmtCutSideRate[0] = 1.5;
+    info.pmtCutSideRate[1] = -2.25;
+    const std::string logoFilenameUtf8("\xE3\x83\xAD\xE3\x82\xB4\xF0\x9F\x98\x80.lgd", 14);
+    const tstring logoFilename = resumeDatUtf8ToTString(logoFilenameUtf8);
+    ResumeDatLogoEntry logoEntry;
+    logoEntry.filename = logoFilename;
+    for (size_t index = 0; index < logoEntry.sha256.size(); index++) {
+        logoEntry.sha256[index] = static_cast<uint8_t>(index);
+    }
+    info.logoTable.push_back(logoEntry);
+    info.detectionLogoIndices.push_back(0);
+    info.ignoreNoLogo = true;
+    info.noLogoInCM = false;
+    info.noDelogo = true;
+    info.looseLogoDetection = false;
+    info.autoLogoDetect = -101;
+    info.autoLogoDetectSearchFrames = 202;
+    info.autoLogoDetectDivX = 303;
+    info.autoLogoDetectDivY = 404;
+    info.autoLogoDetectBlockSize = 505;
+    info.autoLogoDetectThreshold = 606;
+    info.autoLogoDetectMarginX = 707;
+    info.autoLogoDetectMarginY = -808;
+    info.serviceId = 0x11223344;
+    info.numTotalPackets = 0x0102030405060708LL;
+    info.numScramblePackets = -2;
+    info.totalIntVideoSize = 123456789;
+    info.splitterSrcFileSize = info.srcFileSize;
+    info.noDrcsMapCount = 17;
+    ResumeDatVideoInfo video;
+    video.numFrames = 1234;
+    video.selectedLogoIndex = 0;
+    video.logoFrameBytes = { 0x00, 0x7F, 0x80, 0xFF };
+    info.videos.push_back(std::move(video));
+    return info;
+}
+
+extern "C" AMATSUKAZE_API int WriteResumeDatSampleForTest(const tchar* path) {
+    if (path == nullptr) return -1;
+    try {
+        File file(path, _T("wb"));
+        writeResumeDatInfo(file, makeResumeDatSampleForTest());
+        file.flush();
+        return 0;
+    } catch (...) {
+        return -3;
+    }
+}
+
+extern "C" AMATSUKAZE_API int ReadResumeDatManifestForTest(
+    const tchar* path,
+    char* settingsLogoFilenameUtf8,
+    const size_t settingsLogoFilenameCapacity,
+    char* videoLogoFilenameUtf8,
+    const size_t videoLogoFilenameCapacity,
+    int64_t* sourceFileSize,
+    int64_t* sourceWriteTimeFileTime,
+    int32_t* requestedServiceId,
+    int32_t* serviceId,
+    int32_t* videoFrameCount,
+    uint8_t* logoFrameBytes,
+    const size_t logoFrameCapacity,
+    size_t* logoFrameSize) {
+    if (path == nullptr || settingsLogoFilenameUtf8 == nullptr || videoLogoFilenameUtf8 == nullptr
+        || sourceFileSize == nullptr || sourceWriteTimeFileTime == nullptr || requestedServiceId == nullptr
+        || serviceId == nullptr || videoFrameCount == nullptr || logoFrameBytes == nullptr || logoFrameSize == nullptr) {
+        return -1;
+    }
+    try {
+        const ResumeDatInfo info = readResumeDatManifest(path);
+        const std::string settingsFilename = info.detectionLogoIndices.empty()
+            ? std::string()
+            : resumeDatTStringToUtf8(info.logoTable[info.detectionLogoIndices.front()].filename);
+        const ResumeDatVideoInfo* video = info.videos.empty() ? nullptr : &info.videos.front();
+        const std::string videoFilename = video == nullptr || video->selectedLogoIndex < 0
+            ? std::string()
+            : resumeDatTStringToUtf8(info.logoTable[static_cast<size_t>(video->selectedLogoIndex)].filename);
+        const size_t payloadSize = video == nullptr ? 0 : video->logoFrameBytes.size();
+        if (settingsFilename.size() + 1 > settingsLogoFilenameCapacity
+            || videoFilename.size() + 1 > videoLogoFilenameCapacity
+            || payloadSize > logoFrameCapacity) {
+            return -2;
+        }
+        std::memcpy(settingsLogoFilenameUtf8, settingsFilename.c_str(), settingsFilename.size() + 1);
+        std::memcpy(videoLogoFilenameUtf8, videoFilename.c_str(), videoFilename.size() + 1);
+        if (payloadSize != 0) {
+            std::memcpy(logoFrameBytes, video->logoFrameBytes.data(), payloadSize);
+        }
+        *sourceFileSize = info.srcFileSize;
+        *sourceWriteTimeFileTime = info.srcWriteTime;
+        *requestedServiceId = info.requestedServiceId;
+        *serviceId = info.serviceId;
+        *videoFrameCount = video == nullptr ? -1 : video->numFrames;
+        *logoFrameSize = payloadSize;
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+extern "C" AMATSUKAZE_API int RoundTripResumeDatForTest(
+    const tchar* sourcePath, const tchar* outputPath) {
+    if (sourcePath == nullptr || outputPath == nullptr) return -1;
+    try {
+        const ResumeDatInfo info = readResumeDatManifest(sourcePath);
+        File output(outputPath, _T("wb"));
+        writeResumeDatInfo(output, info);
+        output.flush();
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+extern "C" AMATSUKAZE_API int RebaseResumeDatLogoPathsForTest(
+    const tchar* const* savedLogoFilenames,
+    const size_t savedLogoFilenameCount,
+    const tchar* const* currentLogoPaths,
+    const size_t currentLogoPathCount,
+    const tchar* const* videoLogoFilenames,
+    const size_t videoLogoFilenameCount,
+    const tchar* eraseLogoPath,
+    char* outputUtf8,
+    const size_t outputUtf8Capacity,
+    size_t* outputUtf8Length) {
+    if (eraseLogoPath == nullptr || outputUtf8 == nullptr || outputUtf8Length == nullptr
+        || savedLogoFilenameCount > static_cast<size_t>(INT_MAX)
+        || currentLogoPathCount > static_cast<size_t>(INT_MAX)
+        || videoLogoFilenameCount > static_cast<size_t>(INT_MAX)
+        || (savedLogoFilenameCount != 0 && savedLogoFilenames == nullptr)
+        || (currentLogoPathCount != 0 && currentLogoPaths == nullptr)
+        || (videoLogoFilenameCount != 0 && videoLogoFilenames == nullptr)) {
+        return -1;
+    }
+    try {
+        ResumeDatInfo info;
+        info.serviceId = 123;
+        std::vector<tstring> currentPaths;
+        auto addLogoTableEntry = [&](const tstring& filename) -> uint32_t {
+            for (uint32_t index = 0; index < info.logoTable.size(); index++) {
+                if (info.logoTable[index].filename == filename) return index;
+                if (resumeDatLogoNamesCollide(info.logoTable[index].filename, filename)) {
+                    THROW(FormatException, "Resume.dat test fixture has a case-only basename collision");
+                }
+            }
+            ResumeDatLogoEntry entry;
+            entry.filename = filename;
+            info.logoTable.push_back(std::move(entry));
+            return static_cast<uint32_t>(info.logoTable.size() - 1);
+        };
+        for (size_t index = 0; index < savedLogoFilenameCount; index++) {
+            if (savedLogoFilenames[index] == nullptr) return -1;
+            info.detectionLogoIndices.push_back(addLogoTableEntry(savedLogoFilenames[index]));
+        }
+        for (size_t index = 0; index < currentLogoPathCount; index++) {
+            if (currentLogoPaths[index] == nullptr) return -1;
+            currentPaths.emplace_back(currentLogoPaths[index]);
+        }
+        for (size_t index = 0; index < videoLogoFilenameCount; index++) {
+            if (videoLogoFilenames[index] == nullptr) return -1;
+            ResumeDatVideoInfo video;
+            const tstring filename(videoLogoFilenames[index]);
+            if (!filename.empty()) {
+                video.selectedLogoIndex = static_cast<int32_t>(addLogoTableEntry(filename));
+            }
+            info.videos.push_back(std::move(video));
+        }
+        if (*eraseLogoPath != 0) info.eraseLogoIndices.push_back(0);
+
+        tstring reason;
+        if (!rebaseResumeDatLogoPaths(info, currentPaths, reason)) return 1;
+        std::string output;
+        auto appendPath = [&](const tstring& path) {
+            if (!output.empty()) output.push_back(static_cast<char>(10));
+            output += resumeDatTStringToUtf8(path);
+        };
+        for (const auto& path : currentPaths) appendPath(path);
+        for (const auto& video : info.videos) appendPath(video.logoPath);
+        *outputUtf8Length = output.size();
+        if (output.size() + 1 > outputUtf8Capacity) return -2;
+        std::memcpy(outputUtf8, output.c_str(), output.size() + 1);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+extern "C" AMATSUKAZE_API int ValidateResumeDatLogoFilenameForTest(
+    const tchar* filename, const size_t filenameLength) {
+    if (filename == nullptr && filenameLength != 0) return -1;
+    try {
+        const tstring value = filenameLength == 0 ? tstring() : tstring(filename, filenameLength);
+        return isSafeResumeDatLogoFilename(value) ? 0 : 1;
+    } catch (...) {
+        return 1;
+    }
+}
 AMTSplitter::AMTSplitter(AMTContext& ctx, const ConfigWrapper& setting)
     : TsSplitter(ctx, true, true, isCaptionParsingEnabled(setting))
     , setting_(setting)
@@ -1732,6 +3151,10 @@ void DoBadThing() {
 
     int numVideoFiles = reformInfo.getNumVideoFile();
     int mainFileIndex = reformInfo.getMainVideoFileIndex();
+    ResumeDatInfo resumeDatInfo;
+    const bool isReusingResumeDat = !isReusingTmp && tryLoadResumeDat(ctx, setting,
+        resumeDatInfo, reformInfo, serviceId, numTotalPackets, numScramblePackets,
+        totalIntVideoSize, srcFileSize);
     std::vector<std::unique_ptr<CMAnalyze>> cmanalyze;
 
     // ソースファイル読み込み用データ保存
@@ -1764,9 +3187,13 @@ void DoBadThing() {
     // ロゴ・CM解析
     if (!isReusingTmp) {
         rm.wait(HOST_CMD_CMAnalyze);
-        ctx.infoF(_T("[ロゴ・CM解析]"));
+        if (isReusingResumeDat) {
+            ctx.info(_T("[Resume.dat再利用] 候補を通常のロゴ解析位置で照合します"));
+        } else {
+            ctx.infoF(_T("[ロゴ・CM解析]"));
+        }
         sw.start();
-    } else {
+    } else if (isReusingTmp) {
         ctx.info(_T("[一時ファイル再利用] ロゴ・CM解析結果を再利用します"));
     }
     struct LogoMatchState {
@@ -1788,6 +3215,9 @@ void DoBadThing() {
             const auto& resumeVideo = resumeInfo.videos[videoFileIndex];
             cma->restore(resumeVideo.logoPath, resumeVideo.trims, resumeVideo.divs, numFrames);
         } else {
+            if (isReusingResumeDat) {
+                cma->setResumeDatLogoReuse(makeResumeDatLogoReuseData(resumeDatInfo, videoFileIndex));
+            }
             const auto& inputVideofmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0)).videoFormat;
             if (analyzeChapterAndCM || delogoEnabled) {
                 cma->analyze(serviceId, videoFileIndex, inputVideofmt, numFrames, analyzeChapterAndCM);
@@ -1850,6 +3280,13 @@ void DoBadThing() {
 
     if (setting.isNoRemoveTmp()) {
         saveResumeFiles(ctx, setting, reformInfo, cmanalyze,
+            serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize, srcFileSize,
+            noDrcsMapCount, captionsParsed);
+    }
+    const bool resumeDatLogoCacheMiss = std::any_of(cmanalyze.begin(), cmanalyze.end(),
+        [](const auto& analysis) { return analysis->didResumeDatLogoCacheMiss(); });
+    if (!isReusingTmp && (!isReusingResumeDat || resumeDatLogoCacheMiss)) {
+        saveResumeDatSidecar(ctx, setting, reformInfo, cmanalyze,
             serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize, srcFileSize,
             noDrcsMapCount, captionsParsed);
     }

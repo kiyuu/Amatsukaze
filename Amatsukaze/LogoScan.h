@@ -1002,6 +1002,7 @@ class LogoFrame : AMTObject {
     int numLogos;
     std::vector<LogoDataParam> logoArr;
     std::vector<LogoDataParam> deintArr;
+    std::vector<LogoLoadHash> loadedHashes;
 
     int maxYSize;
     int numFrames;
@@ -1150,7 +1151,10 @@ class LogoFrame : AMTObject {
     std::vector<LogoScore> calcLogoScore(const std::vector<std::pair<int, int>>& range, int numCandidates) const;
 
 public:
-    LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio);
+    LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio,
+        bool captureHashes = false);
+
+    const std::vector<LogoLoadHash>& getLoadedHashes() const { return loadedHashes; }
 
     void setClipInfo(PClip clip);
 

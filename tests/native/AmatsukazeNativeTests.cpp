@@ -35,6 +35,12 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -3232,9 +3238,724 @@ public:
         std::ofstream file(path_, std::ios::binary | std::ios::trunc);
         file.write((const char*)data.data(), (std::streamsize)data.size());
     }
+    TempFile(const std::filesystem::path& directory, const TCHAR* name)
+        : path_(directory / name) {}
 private:
     std::filesystem::path path_;
 };
+
+class TempDirectory {
+public:
+    TempDirectory() : TempDirectory(std::filesystem::temp_directory_path()) {}
+    explicit TempDirectory(const std::filesystem::path& base) {
+        for (uint64_t attempt = 0; attempt < 10000; attempt++) {
+            path_ = base / (std::string("amatsukaze_native_test_logo_rebase_") + std::to_string(attempt));
+            std::error_code error;
+            if (std::filesystem::create_directory(path_, error)) return;
+            if (error && error != std::errc::file_exists) {
+                throw std::filesystem::filesystem_error("create temporary test directory", path_, error);
+            }
+        }
+        throw std::runtime_error("cannot create a unique temporary test directory");
+    }
+    ~TempDirectory() {
+        if (!path_.empty()) {
+            std::error_code error;
+            std::filesystem::remove_all(path_, error);
+        }
+    }
+    const std::filesystem::path& path() const { return path_; }
+private:
+    std::filesystem::path path_;
+};
+
+class ScopedCurrentPath {
+public:
+    explicit ScopedCurrentPath(const std::filesystem::path& path)
+        : originalPath_(std::filesystem::current_path()) {
+        std::filesystem::current_path(path);
+    }
+    ~ScopedCurrentPath() {
+        std::error_code error;
+        std::filesystem::current_path(originalPath_, error);
+        if (error) std::printf("FAIL: could not restore current directory: %s\n", error.message().c_str());
+    }
+private:
+    std::filesystem::path originalPath_;
+};
+
+static std::string ResumeTestPathToUtf8(const tstring& path) {
+#ifdef _WIN32
+    if (path.empty()) return std::string();
+    const int inputSize = static_cast<int>(path.size());
+    const int outputSize = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), inputSize,
+        nullptr, 0, nullptr, nullptr);
+    if (outputSize <= 0) return std::string();
+    std::string output(static_cast<size_t>(outputSize), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, path.c_str(), inputSize,
+        output.data(), outputSize, nullptr, nullptr) != outputSize) {
+        return std::string();
+    }
+    return output;
+#else
+    return path;
+#endif
+}
+
+static std::string NormalizeTestPathSeparators(std::string path) {
+    for (auto& character : path) {
+        if (character == static_cast<char>(92)) character = '/';
+    }
+    return path;
+}
+
+constexpr size_t RESUME_DAT_V5_VERSION_OFFSET = 0;
+constexpr size_t RESUME_DAT_V5_CAPTIONS_PARSED_OFFSET = 60;
+constexpr size_t RESUME_DAT_V5_NO_DRCS_MAP_COUNT_OFFSET = 61;
+constexpr size_t RESUME_DAT_V5_PMTCUT_SIDE_RATE_OFFSET = 68;
+constexpr size_t RESUME_DAT_V5_LOGO_TABLE_COUNT_OFFSET = 120;
+constexpr size_t RESUME_DAT_V5_LOGO_ENTRY_OFFSET = 124;
+constexpr size_t RESUME_DAT_V5_LOGO_FILENAME_OFFSET = 128;
+constexpr size_t RESUME_DAT_V5_DETECTION_COUNT_OFFSET = 174;
+constexpr size_t RESUME_DAT_V5_DETECTION_INDEX_OFFSET = 178;
+constexpr size_t RESUME_DAT_V5_ERASE_COUNT_OFFSET = 182;
+constexpr size_t RESUME_DAT_V5_VIDEO_COUNT_OFFSET = 186;
+constexpr size_t RESUME_DAT_V5_VIDEO_FRAME_COUNT_OFFSET = 190;
+constexpr size_t RESUME_DAT_V5_VIDEO_SELECTED_LOGO_OFFSET = 194;
+constexpr size_t RESUME_DAT_V5_VIDEO_SCAN_RANGE_COUNT_OFFSET = 198;
+constexpr size_t RESUME_DAT_V5_VIDEO_LOGO_FRAME_SIZE_OFFSET = 202;
+constexpr size_t RESUME_DAT_V5_VIDEO_LOGO_FRAME_OFFSET = 210;
+
+static const std::vector<uint8_t>& ResumeDatV5GoldenFixture() {
+    // 独立golden: 全214 byteのv5 wireをversion、source/context、logo table、候補、映像順に固定する。
+    static const std::vector<uint8_t> bytes = {
+        0x05, 0x00, 0x00, 0x00, // version = 5
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // source size
+        0x00, 0x80, 0x35, 0x0C, 0xD1, 0xDF, 0xD6, 0x01, // FILETIME ticks
+        0x0D, 0x0C, 0x0B, 0x0A, // requested service ID
+        0x44, 0x33, 0x22, 0x11, // actual service ID
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // splitter source size
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // packet count
+        0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // scramble count = -2
+        0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00, // total video size
+        0x01, // captions parsed
+        0x11, 0x00, 0x00, 0x00, // DRCS map count = 17
+        0x00, 0x01, 0x00, // tsreplace, chapter, PMT cut
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x3F, // 1.5
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC0, // -2.25
+        0x01, 0x00, 0x01, 0x00, // ignoreNoLogo, noLogoInCM, noDelogo, looseLogoDetection
+        0x9B, 0xFF, 0xFF, 0xFF, 0xCA, 0x00, 0x00, 0x00,
+        0x2F, 0x01, 0x00, 0x00, 0x94, 0x01, 0x00, 0x00,
+        0xF9, 0x01, 0x00, 0x00, 0x5E, 0x02, 0x00, 0x00,
+        0xC3, 0x02, 0x00, 0x00, 0xD8, 0xFC, 0xFF, 0xFF, // eight auto-detect ints
+        0x01, 0x00, 0x00, 0x00, // logo table count
+        0x0E, 0x00, 0x00, 0x00, // UTF-8 byte length
+        0xE3, 0x83, 0xAD, 0xE3, 0x82, 0xB4, 0xF0, 0x9F, 0x98, 0x80, 0x2E, 0x6C, 0x67, 0x64, // ロゴ😀.lgd
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, // logo SHA-256
+        0x01, 0x00, 0x00, 0x00, // detection candidate count
+        0x00, 0x00, 0x00, 0x00, // detection candidate index
+        0x00, 0x00, 0x00, 0x00, // erase candidate count
+        0x01, 0x00, 0x00, 0x00, // video count
+        0xD2, 0x04, 0x00, 0x00, // frame count = 1234
+        0x00, 0x00, 0x00, 0x00, // selected table index 0
+        0x00, 0x00, 0x00, 0x00, // scan range count (empty means scan all frames)
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // LogoFrame byte length
+        0x00, 0x7F, 0x80, 0xFF,
+    };
+    return bytes;
+}
+
+static const std::string& ResumeDatSampleLogoFilenameUtf8() {
+    static const std::string value = "\xE3\x83\xAD\xE3\x82\xB4\xF0\x9F\x98\x80.lgd";
+    return value;
+}
+
+static int ReadResumeDatForNativeTest(const tstring& path,
+    char* settingsFilename, const size_t settingsFilenameCapacity,
+    char* videoFilename, const size_t videoFilenameCapacity,
+    int64_t* sourceFileSize, int64_t* sourceWriteTimeFileTime,
+    int32_t* requestedServiceId, int32_t* serviceId, int32_t* videoFrameCount,
+    uint8_t* logoFrameBytes, const size_t logoFrameCapacity, size_t* logoFrameSize) {
+    return ReadResumeDatManifestForTest(path.c_str(), settingsFilename, settingsFilenameCapacity,
+        videoFilename, videoFilenameCapacity, sourceFileSize, sourceWriteTimeFileTime,
+        requestedServiceId, serviceId, videoFrameCount, logoFrameBytes, logoFrameCapacity, logoFrameSize);
+}
+
+static int ReadResumeDatForNativeTest(const tstring& path) {
+    char settingsFilename[64] = {};
+    char videoFilename[64] = {};
+    int64_t sourceFileSize = 0, sourceWriteTimeFileTime = 0;
+    int32_t requestedServiceId = 0, serviceId = 0, videoFrameCount = 0;
+    uint8_t logoFrameBytes[16] = {};
+    size_t logoFrameSize = 0;
+    return ReadResumeDatForNativeTest(path, settingsFilename, sizeof(settingsFilename),
+        videoFilename, sizeof(videoFilename), &sourceFileSize, &sourceWriteTimeFileTime,
+        &requestedServiceId, &serviceId, &videoFrameCount, logoFrameBytes,
+        sizeof(logoFrameBytes), &logoFrameSize);
+}
+
+static bool ExpectResumeDatReadRejected(const std::vector<uint8_t>& bytes,
+    const TCHAR* message, tstring& diagnostic) {
+    TempFile file(_T("resume_dat_invalid_wire.dat"));
+    file.write(bytes);
+    return Expect(ReadResumeDatForNativeTest(file.path()) != 0, message, diagnostic);
+}
+
+bool TestResumeDatV5WireGolden(tstring& diagnostic) {
+    const auto& golden = ResumeDatV5GoldenFixture();
+    if (!Expect(golden.size() == 214, _T("独立golden fixtureの長さが214 byteではありません"), diagnostic)) return false;
+
+    TempFile goldenFile(_T("resume_dat_v5_golden.dat"));
+    TempFile writtenFile(_T("resume_dat_v5_written.dat"));
+    TempFile roundTripFile(_T("resume_dat_v5_roundtrip.dat"));
+    goldenFile.write(golden);
+    const int writeStatus = WriteResumeDatSampleForTest(writtenFile.path().c_str());
+    if (!Expect(writeStatus == 0, _T("Resume.datのproduction writerがgolden sampleを書けませんでした"), diagnostic)) return false;
+    if (!Expect(writtenFile.read() == golden,
+        _T("Resume.datのproduction writer bytesが独立goldenと一致しません"), diagnostic)) return false;
+
+    const int roundTripStatus = RoundTripResumeDatForTest(goldenFile.path().c_str(), roundTripFile.path().c_str());
+    if (!Expect(roundTripStatus == 0, _T("golden fixtureのResume.dat reader/writer round-tripが失敗しました"), diagnostic)) return false;
+    if (!Expect(roundTripFile.read() == golden,
+        _T("golden fixtureのreader/writer round-tripでフィールドbytesが変化しました"), diagnostic)) return false;
+
+    char settingsFilename[64] = {};
+    char videoFilename[64] = {};
+    int64_t sourceFileSize = 0, sourceWriteTimeFileTime = 0;
+    int32_t requestedServiceId = 0, serviceId = 0, videoFrameCount = 0;
+    uint8_t logoFrameBytes[16] = {};
+    size_t logoFrameSize = 0;
+    const int readStatus = ReadResumeDatForNativeTest(goldenFile.path(),
+        settingsFilename, sizeof(settingsFilename), videoFilename, sizeof(videoFilename),
+        &sourceFileSize, &sourceWriteTimeFileTime, &requestedServiceId, &serviceId,
+        &videoFrameCount, logoFrameBytes, sizeof(logoFrameBytes), &logoFrameSize);
+    const uint8_t expectedLogoFrame[] = { 0x00, 0x7F, 0x80, 0xFF };
+    return Expect(readStatus == 0
+        && std::string(settingsFilename) == ResumeDatSampleLogoFilenameUtf8()
+        && std::string(videoFilename) == ResumeDatSampleLogoFilenameUtf8()
+        && sourceFileSize == 0x0102030405060708LL
+        && sourceWriteTimeFileTime == 132539328000000000LL
+        && requestedServiceId == 0x0A0B0C0D && serviceId == 0x11223344
+        && videoFrameCount == 1234 && logoFrameSize == sizeof(expectedLogoFrame)
+        && std::memcmp(logoFrameBytes, expectedLogoFrame, sizeof(expectedLogoFrame)) == 0,
+        _T("golden fixtureからUTF-8 basename・FILETIME・ID・frame count・LogoFrameを読み出せません"), diagnostic);
+}
+
+static void AppendResumeDatV5Uint32(std::vector<uint8_t>& bytes, const uint32_t value) {
+    for (size_t index = 0; index < sizeof(value); index++) {
+        bytes.push_back(static_cast<uint8_t>((value >> (index * 8)) & 0xFF));
+    }
+}
+
+static void AppendResumeDatV5Int32(std::vector<uint8_t>& bytes, const int32_t value) {
+    AppendResumeDatV5Uint32(bytes, static_cast<uint32_t>(value));
+}
+
+static void AppendResumeDatV5Uint64(std::vector<uint8_t>& bytes, const uint64_t value) {
+    for (size_t index = 0; index < sizeof(value); index++) {
+        bytes.push_back(static_cast<uint8_t>((value >> (index * 8)) & 0xFF));
+    }
+}
+
+static void AppendResumeDatV5LogoEntry(
+    std::vector<uint8_t>& bytes, const std::string& filename, const uint8_t hashStart) {
+    AppendResumeDatV5Uint32(bytes, static_cast<uint32_t>(filename.size()));
+    bytes.insert(bytes.end(), filename.begin(), filename.end());
+    for (uint32_t index = 0; index < 32; index++) {
+        bytes.push_back(static_cast<uint8_t>(hashStart + index));
+    }
+}
+
+static std::vector<uint8_t> MakeResumeDatV5LogoTableOrderFixture() {
+    const auto& golden = ResumeDatV5GoldenFixture();
+    std::vector<uint8_t> bytes(golden.begin(), golden.begin() + RESUME_DAT_V5_LOGO_TABLE_COUNT_OFFSET);
+    AppendResumeDatV5Uint32(bytes, 3); // 通常候補、消去候補、映像選択の初出順
+    bytes.insert(bytes.end(), golden.begin() + RESUME_DAT_V5_LOGO_ENTRY_OFFSET,
+        golden.begin() + RESUME_DAT_V5_DETECTION_COUNT_OFFSET);
+    AppendResumeDatV5LogoEntry(bytes, "erase.lgd", 0x20);
+    AppendResumeDatV5LogoEntry(bytes, "selected.lgd", 0x40);
+
+    AppendResumeDatV5Uint32(bytes, 1); // detection candidates
+    AppendResumeDatV5Uint32(bytes, 0);
+    AppendResumeDatV5Uint32(bytes, 1); // erase candidates
+    AppendResumeDatV5Uint32(bytes, 1);
+    AppendResumeDatV5Uint32(bytes, 2); // videos
+    AppendResumeDatV5Int32(bytes, 1234);
+    AppendResumeDatV5Int32(bytes, 2);
+    AppendResumeDatV5Uint32(bytes, 2); // 走査範囲: [0,10), [20,30)
+    AppendResumeDatV5Int32(bytes, 0);
+    AppendResumeDatV5Int32(bytes, 10);
+    AppendResumeDatV5Int32(bytes, 20);
+    AppendResumeDatV5Int32(bytes, 30);
+    AppendResumeDatV5Uint64(bytes, 4);
+    bytes.insert(bytes.end(), { 0x00, 0x7F, 0x80, 0xFF });
+    AppendResumeDatV5Int32(bytes, 42);
+    AppendResumeDatV5Int32(bytes, -1);
+    AppendResumeDatV5Uint32(bytes, 0); // 未選択videoは走査範囲なし
+    AppendResumeDatV5Uint64(bytes, 0);
+    return bytes;
+}
+
+bool TestResumeDatV5LogoTableOrderRoundTrip(tstring& diagnostic) {
+    const auto fixture = MakeResumeDatV5LogoTableOrderFixture();
+    if (!Expect(fixture.size() == 347,
+        _T("複数ロゴ候補・範囲・未選択video fixtureの長さが347 byteではありません"), diagnostic)) return false;
+
+    TempFile input(_T("resume_dat_v5_logo_table_order.dat"));
+    TempFile output(_T("resume_dat_v5_logo_table_roundtrip.dat"));
+    input.write(fixture);
+    const int roundTripStatus = RoundTripResumeDatForTest(input.path().c_str(), output.path().c_str());
+    if (!Expect(roundTripStatus == 0,
+        _T("複数ロゴ候補・範囲を含むResume.datのreader/writer round-tripが失敗しました"), diagnostic)) return false;
+    if (!Expect(output.read() == fixture,
+        _T("ロゴtable順、candidate index、video選択、scan range、LogoFrame bytesがround-tripで変化しました"), diagnostic)) return false;
+
+    char settingsFilename[64] = {};
+    char videoFilename[64] = {};
+    int64_t sourceFileSize = 0, sourceWriteTimeFileTime = 0;
+    int32_t requestedServiceId = 0, serviceId = 0, videoFrameCount = 0;
+    uint8_t logoFrameBytes[16] = {};
+    size_t logoFrameSize = 0;
+    const uint8_t expectedLogoFrame[] = { 0x00, 0x7F, 0x80, 0xFF };
+    const int readStatus = ReadResumeDatForNativeTest(input.path(),
+        settingsFilename, sizeof(settingsFilename), videoFilename, sizeof(videoFilename),
+        &sourceFileSize, &sourceWriteTimeFileTime, &requestedServiceId, &serviceId,
+        &videoFrameCount, logoFrameBytes, sizeof(logoFrameBytes), &logoFrameSize);
+    return Expect(readStatus == 0
+        && std::string(settingsFilename) == ResumeDatSampleLogoFilenameUtf8()
+        && std::string(videoFilename) == "selected.lgd"
+        && videoFrameCount == 1234 && logoFrameSize == 4
+        && std::memcmp(logoFrameBytes, expectedLogoFrame, sizeof(expectedLogoFrame)) == 0,
+        _T("通常候補と選択済みロゴがtable indexから解決されません"), diagnostic);
+}
+
+static void SetResumeDatUint32LittleEndian(std::vector<uint8_t>& bytes, const size_t offset, const uint32_t value) {
+    for (size_t index = 0; index < sizeof(value); index++) {
+        bytes[offset + index] = static_cast<uint8_t>((value >> (index * 8)) & 0xFF);
+    }
+}
+
+static void SetResumeDatInt32LittleEndian(std::vector<uint8_t>& bytes, const size_t offset, const int32_t value) {
+    SetResumeDatUint32LittleEndian(bytes, offset, static_cast<uint32_t>(value));
+}
+
+static void SetResumeDatUint64LittleEndian(std::vector<uint8_t>& bytes, const size_t offset, const uint64_t value) {
+    for (size_t index = 0; index < sizeof(value); index++) {
+        bytes[offset + index] = static_cast<uint8_t>((value >> (index * 8)) & 0xFF);
+    }
+}
+
+bool TestResumeDatV5RejectsInvalidWire(tstring& diagnostic) {
+    const auto& golden = ResumeDatV5GoldenFixture();
+    constexpr uint32_t MAX_RESUME_DAT_LOGO_TABLE_COUNT_FOR_TEST = 3U * 4096U;
+
+    auto invalidUtf8 = golden;
+    invalidUtf8[RESUME_DAT_V5_LOGO_FILENAME_OFFSET] = 0xFF;
+    if (!ExpectResumeDatReadRejected(invalidUtf8, _T("不正UTF-8を含むResume.datを受理しました"), diagnostic)) return false;
+
+    auto embeddedNul = golden;
+    embeddedNul[RESUME_DAT_V5_LOGO_FILENAME_OFFSET + 11] = 0x00;
+    if (!ExpectResumeDatReadRejected(embeddedNul, _T("NULを含むUTF-8 basenameを受理しました"), diagnostic)) return false;
+
+    auto pathInBasename = golden;
+    pathInBasename[RESUME_DAT_V5_LOGO_FILENAME_OFFSET + 10] = '/';
+    if (!ExpectResumeDatReadRejected(pathInBasename, _T("path成分を含むlogo basenameを受理しました"), diagnostic)) return false;
+
+    auto invalidBool = golden;
+    invalidBool[RESUME_DAT_V5_CAPTIONS_PARSED_OFFSET] = 2;
+    if (!ExpectResumeDatReadRejected(invalidBool, _T("0/1以外のbool値を受理しました"), diagnostic)) return false;
+
+    auto truncated = golden;
+    truncated.pop_back();
+    if (!ExpectResumeDatReadRejected(truncated, _T("末尾が切れたResume.datを受理しました"), diagnostic)) return false;
+
+    auto trailingByte = golden;
+    trailingByte.push_back(0);
+    if (!ExpectResumeDatReadRejected(trailingByte, _T("未解釈の末尾byteを含むResume.datを受理しました"), diagnostic)) return false;
+
+    auto oversizedString = golden;
+    SetResumeDatUint32LittleEndian(oversizedString, RESUME_DAT_V5_LOGO_ENTRY_OFFSET, 1024 * 1024 + 1);
+    if (!ExpectResumeDatReadRejected(oversizedString, _T("上限を超えるUTF-8文字列長を受理しました"), diagnostic)) return false;
+
+    auto oversizedLogoCount = golden;
+    SetResumeDatUint32LittleEndian(oversizedLogoCount, RESUME_DAT_V5_LOGO_TABLE_COUNT_OFFSET,
+        MAX_RESUME_DAT_LOGO_TABLE_COUNT_FOR_TEST + 1);
+    if (!ExpectResumeDatReadRejected(oversizedLogoCount, _T("上限を超えるロゴtable数を受理しました"), diagnostic)) return false;
+
+    auto oversizedDetectionCount = golden;
+    SetResumeDatUint32LittleEndian(oversizedDetectionCount, RESUME_DAT_V5_DETECTION_COUNT_OFFSET, 4097);
+    if (!ExpectResumeDatReadRejected(oversizedDetectionCount, _T("上限を超える通常候補数を受理しました"), diagnostic)) return false;
+
+    auto duplicateLogoName = golden;
+    const std::vector<uint8_t> duplicateLogoEntry(
+        golden.begin() + RESUME_DAT_V5_LOGO_ENTRY_OFFSET,
+        golden.begin() + RESUME_DAT_V5_DETECTION_COUNT_OFFSET);
+    duplicateLogoName.insert(duplicateLogoName.begin() + RESUME_DAT_V5_DETECTION_COUNT_OFFSET,
+        duplicateLogoEntry.begin(), duplicateLogoEntry.end());
+    SetResumeDatUint32LittleEndian(duplicateLogoName, RESUME_DAT_V5_LOGO_TABLE_COUNT_OFFSET, 2);
+    if (!ExpectResumeDatReadRejected(duplicateLogoName, _T("重複basenameを持つlogo tableを受理しました"), diagnostic)) return false;
+
+    auto invalidDetectionIndex = golden;
+    SetResumeDatUint32LittleEndian(invalidDetectionIndex, RESUME_DAT_V5_DETECTION_INDEX_OFFSET, 1);
+    if (!ExpectResumeDatReadRejected(invalidDetectionIndex, _T("table範囲外の通常候補indexを受理しました"), diagnostic)) return false;
+
+    auto duplicateDetectionIndex = golden;
+    duplicateDetectionIndex.insert(duplicateDetectionIndex.begin() + RESUME_DAT_V5_ERASE_COUNT_OFFSET,
+        { 0x00, 0x00, 0x00, 0x00 });
+    SetResumeDatUint32LittleEndian(duplicateDetectionIndex, RESUME_DAT_V5_DETECTION_COUNT_OFFSET, 2);
+    if (!ExpectResumeDatReadRejected(duplicateDetectionIndex, _T("重複通常候補indexを受理しました"), diagnostic)) return false;
+
+    auto invalidEraseIndex = golden;
+    SetResumeDatUint32LittleEndian(invalidEraseIndex, RESUME_DAT_V5_ERASE_COUNT_OFFSET, 1);
+    invalidEraseIndex.insert(invalidEraseIndex.begin() + RESUME_DAT_V5_VIDEO_COUNT_OFFSET,
+        { 0x01, 0x00, 0x00, 0x00 });
+    if (!ExpectResumeDatReadRejected(invalidEraseIndex, _T("table範囲外の消去候補indexを受理しました"), diagnostic)) return false;
+
+    auto invalidVideoCount = golden;
+    SetResumeDatUint32LittleEndian(invalidVideoCount, RESUME_DAT_V5_VIDEO_COUNT_OFFSET, 4097);
+    if (!ExpectResumeDatReadRejected(invalidVideoCount, _T("上限を超えるvideo数を受理しました"), diagnostic)) return false;
+
+    auto negativeFrameCount = golden;
+    SetResumeDatInt32LittleEndian(negativeFrameCount, RESUME_DAT_V5_VIDEO_FRAME_COUNT_OFFSET, -1);
+    if (!ExpectResumeDatReadRejected(negativeFrameCount, _T("負のframe countを受理しました"), diagnostic)) return false;
+
+    auto negativeDrcsCount = golden;
+    SetResumeDatInt32LittleEndian(negativeDrcsCount, RESUME_DAT_V5_NO_DRCS_MAP_COUNT_OFFSET, -1);
+    if (!ExpectResumeDatReadRejected(negativeDrcsCount, _T("負のDRCS未登録数を受理しました"), diagnostic)) return false;
+
+    auto nonFiniteRate = golden;
+    SetResumeDatUint64LittleEndian(nonFiniteRate, RESUME_DAT_V5_PMTCUT_SIDE_RATE_OFFSET, 0x7FF8000000000000ULL);
+    if (!ExpectResumeDatReadRejected(nonFiniteRate, _T("有限値でないPMT cut side rateを受理しました"), diagnostic)) return false;
+
+    auto oversizedPayload = golden;
+    SetResumeDatUint64LittleEndian(oversizedPayload,
+        RESUME_DAT_V5_VIDEO_LOGO_FRAME_SIZE_OFFSET, 64ULL * 1024 * 1024 + 1);
+    if (!ExpectResumeDatReadRejected(oversizedPayload, _T("上限を超えるLogoFrame長を受理しました"), diagnostic)) return false;
+
+    auto wrongVersion = golden;
+    wrongVersion[RESUME_DAT_V5_VERSION_OFFSET] = 4;
+    if (!ExpectResumeDatReadRejected(wrongVersion, _T("version 4のResume.datを受理しました"), diagnostic)) return false;
+
+    auto invalidSelectedIndex = golden;
+    SetResumeDatInt32LittleEndian(invalidSelectedIndex, RESUME_DAT_V5_VIDEO_SELECTED_LOGO_OFFSET, 1);
+    if (!ExpectResumeDatReadRejected(invalidSelectedIndex, _T("table範囲外のselected logo indexを受理しました"), diagnostic)) return false;
+
+    auto selectedIndexBelowNone = golden;
+    SetResumeDatInt32LittleEndian(selectedIndexBelowNone, RESUME_DAT_V5_VIDEO_SELECTED_LOGO_OFFSET, -2);
+    if (!ExpectResumeDatReadRejected(selectedIndexBelowNone, _T("-1より小さいselected logo indexを受理しました"), diagnostic)) return false;
+
+    auto excessiveRangeCount = golden;
+    SetResumeDatUint32LittleEndian(excessiveRangeCount, RESUME_DAT_V5_VIDEO_SCAN_RANGE_COUNT_OFFSET, 1235);
+    if (!ExpectResumeDatReadRejected(excessiveRangeCount, _T("frame countを超えるscan range数を受理しました"), diagnostic)) return false;
+
+    auto unselectedWithRange = golden;
+    SetResumeDatInt32LittleEndian(unselectedWithRange, RESUME_DAT_V5_VIDEO_SELECTED_LOGO_OFFSET, -1);
+    SetResumeDatUint32LittleEndian(unselectedWithRange, RESUME_DAT_V5_VIDEO_SCAN_RANGE_COUNT_OFFSET, 1);
+    if (!ExpectResumeDatReadRejected(unselectedWithRange, _T("未選択videoのscan rangeを受理しました"), diagnostic)) return false;
+
+    auto invalidRangeBounds = golden;
+    SetResumeDatUint32LittleEndian(invalidRangeBounds, RESUME_DAT_V5_VIDEO_SCAN_RANGE_COUNT_OFFSET, 1);
+    invalidRangeBounds.insert(invalidRangeBounds.begin() + RESUME_DAT_V5_VIDEO_LOGO_FRAME_SIZE_OFFSET,
+        { 0x0A, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 }); // start=10, endExclusive=2
+    if (!ExpectResumeDatReadRejected(invalidRangeBounds, _T("start>=endExclusiveのscan rangeを受理しました"), diagnostic)) return false;
+
+    auto rangeBeyondFrameCount = golden;
+    SetResumeDatUint32LittleEndian(rangeBeyondFrameCount, RESUME_DAT_V5_VIDEO_SCAN_RANGE_COUNT_OFFSET, 1);
+    rangeBeyondFrameCount.insert(rangeBeyondFrameCount.begin() + RESUME_DAT_V5_VIDEO_LOGO_FRAME_SIZE_OFFSET,
+        { 0x00, 0x00, 0x00, 0x00, 0xD3, 0x04, 0x00, 0x00 }); // [0,1235), frame count=1234
+    if (!ExpectResumeDatReadRejected(rangeBeyondFrameCount, _T("frame countを超えるscan range endを受理しました"), diagnostic)) return false;
+
+    auto overlappingRanges = golden;
+    SetResumeDatUint32LittleEndian(overlappingRanges, RESUME_DAT_V5_VIDEO_SCAN_RANGE_COUNT_OFFSET, 2);
+    overlappingRanges.insert(overlappingRanges.begin() + RESUME_DAT_V5_VIDEO_LOGO_FRAME_SIZE_OFFSET,
+        { 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00,
+          0x09, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00 }); // [0,10), [9,15)
+    if (!ExpectResumeDatReadRejected(overlappingRanges, _T("重複scan rangeを受理しました"), diagnostic)) return false;
+
+    auto selectedWithoutPayload = golden;
+    SetResumeDatUint64LittleEndian(selectedWithoutPayload, RESUME_DAT_V5_VIDEO_LOGO_FRAME_SIZE_OFFSET, 0);
+    selectedWithoutPayload.resize(RESUME_DAT_V5_VIDEO_LOGO_FRAME_OFFSET);
+    if (!ExpectResumeDatReadRejected(selectedWithoutPayload, _T("LogoFrame payloadのないselected videoを受理しました"), diagnostic)) return false;
+
+    auto unselectedWithPayload = golden;
+    SetResumeDatInt32LittleEndian(unselectedWithPayload, RESUME_DAT_V5_VIDEO_SELECTED_LOGO_OFFSET, -1);
+    return ExpectResumeDatReadRejected(unselectedWithPayload,
+        _T("selected logoなしのvideoへpayloadを保存したResume.datを受理しました"), diagnostic);
+}
+
+static int RebaseLogoPathsForNativeTest(
+    const std::vector<tstring>& savedLogoFilenames,
+    const std::vector<tstring>& currentLogoPaths,
+    const std::vector<tstring>& videoLogoFilenames,
+    const tstring& eraseLogoPath,
+    std::string& output) {
+    std::vector<const tchar*> savedPointers, currentPointers, videoPointers;
+    for (const auto& filename : savedLogoFilenames) savedPointers.push_back(filename.c_str());
+    for (const auto& path : currentLogoPaths) currentPointers.push_back(path.c_str());
+    for (const auto& filename : videoLogoFilenames) videoPointers.push_back(filename.c_str());
+    char buffer[4096] = {};
+    size_t outputLength = 0;
+    const int status = RebaseResumeDatLogoPathsForTest(
+        savedPointers.data(), savedPointers.size(),
+        currentPointers.data(), currentPointers.size(),
+        videoPointers.data(), videoPointers.size(),
+        eraseLogoPath.c_str(), buffer, sizeof(buffer), &outputLength);
+    if (status == 0) output.assign(buffer, outputLength);
+    return status;
+}
+
+static int ValidateResumeDatLogoFilenameForNativeTest(const tstring& filename) {
+    return ValidateResumeDatLogoFilenameForTest(filename.data(), filename.size());
+}
+
+bool TestResumeDatLogoFilenameRebase(tstring& diagnostic) {
+    TempDirectory directory(std::filesystem::current_path());
+    TempFile selectedLogo(directory.path(), _T("selected_日本.lgd"));
+    TempFile secondLogo(directory.path(), _T("second.lgd"));
+    TempFile otherLogo(directory.path(), _T("other.lgd"));
+    selectedLogo.write({ 0x78 });
+    secondLogo.write({ 0x79 });
+    otherLogo.write({ 0x7A });
+
+    const tstring selectedFilename = _T("selected_日本.lgd");
+    const std::vector<tstring> savedFilenames = { selectedFilename };
+    const std::vector<tstring> currentPaths = { selectedLogo.path() };
+    const std::vector<tstring> videoFilenames = { selectedFilename };
+    std::string output;
+    int status = RebaseLogoPathsForNativeTest(savedFilenames, currentPaths, videoFilenames, tstring(), output);
+    const std::string currentUtf8 = ResumeTestPathToUtf8(selectedLogo.path());
+    const auto canonicalDirectory = std::filesystem::canonical(directory.path());
+    const auto canonicalSelectedLogoPath = canonicalDirectory / std::filesystem::path(selectedFilename);
+    const std::string canonicalSelectedUtf8 = ResumeTestPathToUtf8(canonicalSelectedLogoPath.native());
+    if (!Expect(status == 0 && output == currentUtf8 + "\n" + canonicalSelectedUtf8,
+        _T("日本語logo basenameを現在の設定pathへ解決できません"), diagnostic)) return false;
+
+    const auto relativeParent = directory.path() / _T("nested") / _T("deeper");
+    std::filesystem::create_directories(relativeParent);
+    const auto relativeLogoPath = std::filesystem::path(_T(".")) / directory.path().filename()
+        / _T("nested") / _T("deeper") / _T("..") / _T("..") / _T("selected_日本.lgd");
+    const tstring relativeLogoPathString = relativeLogoPath.native();
+    status = RebaseLogoPathsForNativeTest(savedFilenames, { relativeLogoPathString }, videoFilenames,
+        tstring(), output);
+    const std::string relativeLogoUtf8 = ResumeTestPathToUtf8(relativeLogoPathString);
+    if (!Expect(status == 0 && output == relativeLogoUtf8 + "\n" + canonicalSelectedUtf8,
+        _T("./ と nested ../ を含む現在のlogo pathを解決できません"), diagnostic)) return false;
+
+    {
+        TempDirectory bareDirectory(directory.path());
+        ScopedCurrentPath bareCurrentPath(bareDirectory.path());
+        const tstring bareFilename = _T("resume_dat_logo_bare_current_path.lgd");
+        TempFile bareLogo(std::filesystem::current_path(), bareFilename.c_str());
+        bareLogo.write({ 0x7A });
+        status = RebaseLogoPathsForNativeTest({ bareFilename }, { bareFilename }, { bareFilename },
+            tstring(), output);
+        const std::string canonicalBareUtf8 = ResumeTestPathToUtf8(
+            (std::filesystem::canonical(std::filesystem::current_path()) / bareFilename).native());
+        if (!Expect(status == 0 && output == ResumeTestPathToUtf8(bareFilename) + "\n" + canonicalBareUtf8,
+            _T("parentが空のbare filenameをcurrent directoryから解決できません"), diagnostic)) return false;
+    }
+
+    if (!Expect(ValidateResumeDatLogoFilenameForNativeTest(selectedFilename) == 0,
+        _T("日本語logo basenameを不正と判定しました"), diagnostic)) return false;
+    for (const auto& invalidFilename : { tstring(), tstring(_T(".")), tstring(_T("..")),
+        tstring(_T("../selected.lgd")), tstring(_T("folder/selected.lgd")),
+        tstring(_T("folder\\selected.lgd")), tstring(_T("C:relative.lgd")) }) {
+        if (!Expect(ValidateResumeDatLogoFilenameForNativeTest(invalidFilename) != 0,
+            _T("path成分を含むlogo basenameを受理しました"), diagnostic)) return false;
+    }
+    tstring nulFilename = _T("selected");
+    nulFilename.push_back(static_cast<tchar>(0));
+    nulFilename += _T(".lgd");
+    if (!Expect(ValidateResumeDatLogoFilenameForNativeTest(nulFilename) != 0,
+        _T("NULを含むlogo basenameを受理しました"), diagnostic)) return false;
+
+    const tstring autoFilename = _T("SID123-auto-20261104_010203.lgd");
+    TempFile autoLogo(directory.path(), autoFilename.c_str());
+    autoLogo.write({ 0x7B });
+    status = RebaseLogoPathsForNativeTest(savedFilenames, currentPaths, { autoFilename }, tstring(), output);
+    const std::string expectedAuto = currentUtf8 + "\n" + ResumeTestPathToUtf8(
+        (canonicalDirectory / autoFilename).native());
+    if (!Expect(status == 0 && output == expectedAuto,
+        _T("生成形式のSID-auto logo basenameを現在rootへ解決できません"), diagnostic)) return false;
+
+    const tstring wrongServiceAuto = _T("SID124-auto-20261104_010203.lgd");
+    TempFile wrongServiceAutoLogo(directory.path(), wrongServiceAuto.c_str());
+    wrongServiceAutoLogo.write({ 0x7C });
+    if (!Expect(RebaseLogoPathsForNativeTest(savedFilenames, currentPaths,
+        { wrongServiceAuto }, tstring(), output) != 0,
+        _T("別serviceIdのauto logoを受理しました"), diagnostic)) return false;
+
+    const tstring malformedAuto = _T("SID123-auto-not-a-timestamp.lgd");
+    TempFile malformedAutoLogo(directory.path(), malformedAuto.c_str());
+    malformedAutoLogo.write({ 0x7D });
+    if (!Expect(RebaseLogoPathsForNativeTest(savedFilenames, currentPaths,
+        { malformedAuto }, tstring(), output) != 0,
+        _T("生成形式でないauto logo basenameを受理しました"), diagnostic)) return false;
+
+    const std::vector<tstring> twoSavedFilenames = { selectedFilename, _T("second.lgd") };
+    TempDirectory otherDirectory;
+    TempFile otherSecondLogo(otherDirectory.path(), _T("second.lgd"));
+    otherSecondLogo.write({ 0x7E });
+    const auto equivalentRootSecondPath = directory.path() / _T("nested") / _T("..") / _T("second.lgd");
+    status = RebaseLogoPathsForNativeTest(twoSavedFilenames,
+        { selectedLogo.path(), equivalentRootSecondPath.native() }, { selectedFilename }, tstring(), output);
+    if (!Expect(status == 0 && output == currentUtf8 + "\n"
+        + ResumeTestPathToUtf8(equivalentRootSecondPath.native()) + "\n" + canonicalSelectedUtf8,
+        _T("構文上異なるが同一rootへ解決する複数logo設定を受理できません"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(twoSavedFilenames,
+        { selectedLogo.path(), otherSecondLogo.path() }, { selectedFilename }, tstring(), output) != 0,
+        _T("別rootに分かれたlogo設定を受理しました"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(twoSavedFilenames, { selectedLogo.path() },
+        { selectedFilename }, tstring(), output) != 0,
+        _T("logo設定数の不一致を受理しました"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(twoSavedFilenames,
+        { secondLogo.path(), selectedLogo.path() }, { selectedFilename }, tstring(), output) != 0,
+        _T("順序が入れ替わったlogo設定を受理しました"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(savedFilenames, { otherLogo.path() },
+        videoFilenames, tstring(), output) != 0,
+        _T("saved/current basenameの不一致を受理しました"), diagnostic)) return false;
+    const tstring caseOnlyFilename = _T("Selected_日本.lgd");
+    if (!Expect(RebaseLogoPathsForNativeTest({ caseOnlyFilename }, currentPaths,
+        videoFilenames, tstring(), output) != 0,
+        _T("ロゴ設定のbasenameに大文字・小文字だけの差がある状態を受理しました"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(savedFilenames, currentPaths,
+        { caseOnlyFilename }, tstring(), output) != 0,
+        _T("video basenameに大文字・小文字だけの差がある状態を受理しました"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(
+        { selectedFilename, selectedFilename },
+        { selectedLogo.path(), selectedLogo.path() },
+        { selectedFilename }, tstring(), output) != 0,
+        _T("重複するlogo basenameの衝突を受理しました"), diagnostic)) return false;
+    TempFile caseVariantLogo(directory.path(), caseOnlyFilename.c_str());
+    caseVariantLogo.write({ 0x7F });
+    if (!Expect(RebaseLogoPathsForNativeTest(
+        { selectedFilename, caseOnlyFilename },
+        { selectedLogo.path(), caseVariantLogo.path() },
+        { selectedFilename }, tstring(), output) != 0,
+        _T("ASCII大小文字だけが異なるlogo basenameの衝突を受理しました"), diagnostic)) return false;
+
+    const tstring missingPath = (directory.path() / _T("missing.lgd")).native();
+    if (!Expect(RebaseLogoPathsForNativeTest(
+        { _T("missing.lgd") }, { missingPath }, { _T("missing.lgd") }, tstring(), output) != 0,
+        _T("現在のlogo fileが欠落した設定を受理しました"), diagnostic)) return false;
+
+    TempDirectory symlinkRoot;
+    TempDirectory outsideRoot;
+    TempFile outsideLogo(outsideRoot.path(), _T("selected_日本.lgd"));
+    outsideLogo.write({ 0x7C });
+    TempFile sameRootTarget(symlinkRoot.path(), _T("target.lgd"));
+    sameRootTarget.write({ 0x7D });
+    const auto symlinkPath = symlinkRoot.path() / _T("selected_日本.lgd");
+    std::error_code symlinkError;
+    std::filesystem::create_symlink(std::filesystem::path(outsideLogo.path()), symlinkPath, symlinkError);
+    if (!symlinkError) {
+        if (!Expect(RebaseLogoPathsForNativeTest(savedFilenames, { symlinkPath.native() },
+            videoFilenames, tstring(), output) != 0,
+            _T("current logo root外を指すsymlinkを受理しました"), diagnostic)) return false;
+        const tstring aliasFilename = _T("alias.lgd");
+        const auto aliasPath = symlinkRoot.path() / aliasFilename;
+        std::error_code aliasError;
+        std::filesystem::create_symlink(std::filesystem::path(sameRootTarget.path()), aliasPath, aliasError);
+        if (!aliasError) {
+            status = RebaseLogoPathsForNativeTest({ aliasFilename }, { aliasPath.native() },
+                { aliasFilename }, tstring(), output);
+            const std::string expectedAliasOutput = ResumeTestPathToUtf8(aliasPath.native()) + "\n"
+                + ResumeTestPathToUtf8((std::filesystem::canonical(symlinkRoot.path()) / aliasFilename).native());
+            if (!Expect(status == 0 && output == expectedAliasOutput,
+                _T("同一root内のsymlinkで指定basenameを保てません"), diagnostic)) return false;
+        } else {
+            std::printf("SKIP: same-root symlink basename check unavailable: %s\n", aliasError.message().c_str());
+        }
+    } else {
+        std::printf("SKIP: root-escape symlink check unavailable: %s\n", symlinkError.message().c_str());
+    }
+
+    if (!Expect(RebaseLogoPathsForNativeTest({}, {}, { tstring() }, tstring(), output) == 0
+        && output.empty(), _T("logoなしの設定をfallbackと誤判定しました"), diagnostic)) return false;
+    if (!Expect(RebaseLogoPathsForNativeTest(savedFilenames, currentPaths, videoFilenames,
+        _T("erase.lgd"), output) != 0,
+        _T("追加ロゴ消し設定をResume.dat再利用へ通しました"), diagnostic)) return false;
+    return true;
+}
+
+bool TestLogoOffInJLLegacyEquivalence(tstring& diagnostic) {
+    struct TestCase {
+        const TCHAR* name;
+        std::string contents;
+        int expected;
+    };
+    std::vector<TestCase> testCases = {
+        { _T("empty"), "", 0 },
+        { _T("no match"), "Set x 1\n", 0 },
+        { _T("exact match"), "LogoOff\n", 1 },
+        { _T("no final newline"), "LogoOff", 1 },
+        { _T("spaces"), " \tLogoOff \n", 1 },
+        { _T("comment only"), "# LogoOff\n", 0 },
+        { _T("comment after other text"), "Set x 1 # LogoOff\n", 0 },
+        { _T("inline comment after match"), "LogoOff # comment\n", 1 },
+        { _T("match after comment line"), "# LogoOff\nSet x 1\nLogoOff\n", 1 },
+        { _T("lower case"), "logooff\n", 0 },
+        { _T("upper case"), "LOGOOFF\n", 0 },
+        { _T("mixed case"), "LogoOFF\n", 0 },
+        { _T("substring"), "prefixLogoOffsuffix\n", 1 },
+        { _T("quoted substring"), "Set x \"LogoOff\"\n", 1 },
+        { _T("hash inside quotes still starts comment"), "Set x \"#LogoOff\"\n", 0 },
+        { _T("token split across lines"), "Logo\nOff\n", 0 },
+        { _T("CRLF"), "# LogoOff\r\nLogoOff\r\n", 1 },
+        { _T("UTF-8 BOM and Japanese"), std::string("\xEF\xBB\xBF") + "# ロゴ設定\nLogoOff\n", 1 },
+        { _T("match across File getline buffer"), std::string(196, 'x') + "LogoOff\n", 1 },
+        { _T("comment across File getline buffer"), "#" + std::string(400, 'x') + "LogoOff\n", 0 },
+    };
+
+    TempDirectory directory;
+    TempFile commandFile(directory.path(), _T("logooff.jl"));
+    for (const auto& testCase : testCases) {
+        const std::vector<uint8_t> expectedBytes(testCase.contents.begin(), testCase.contents.end());
+        if (testCase.contents.empty()) {
+            std::ofstream emptyFile(std::filesystem::path(commandFile.path()), std::ios::binary | std::ios::trunc);
+            if (!Expect(emptyFile.is_open(), _T("空のJL fixtureを作成できません"), diagnostic)) return false;
+        } else {
+            commandFile.write(expectedBytes);
+        }
+        if (!Expect(commandFile.read() == expectedBytes,
+            strsprintf(_T("fixtureを書き戻せません: %s"), testCase.name).c_str(), diagnostic)) return false;
+
+        int legacyOutcome = -1;
+        int currentOutcome = -1;
+        if (!Expect(CompareLogoOffInJLForTest(commandFile.path().c_str(), &legacyOutcome, &currentOutcome)
+            == LOGO_OFF_IN_JL_TEST_SUCCESS,
+            strsprintf(_T("LogoOff判定seamを実行できません: %s"), testCase.name).c_str(), diagnostic)) return false;
+        if (!Expect(legacyOutcome == testCase.expected,
+            strsprintf(_T("旧LogoOff判定が固定期待値と異なります: %s, result=%d"),
+                testCase.name, legacyOutcome).c_str(), diagnostic)) return false;
+        if (!Expect(currentOutcome == testCase.expected,
+            strsprintf(_T("現在のLogoOff判定が固定期待値と異なります: %s, result=%d"),
+                testCase.name, currentOutcome).c_str(), diagnostic)) return false;
+        if (!Expect(legacyOutcome == currentOutcome,
+            strsprintf(_T("旧・現在のLogoOff判定が異なります: %s, old=%d, current=%d"),
+                testCase.name, legacyOutcome, currentOutcome).c_str(), diagnostic)) return false;
+    }
+
+    const tstring missingPath = (directory.path() / _T("missing.jl")).native();
+    int legacyOutcome = -1;
+    int currentOutcome = -1;
+    if (!Expect(CompareLogoOffInJLForTest(missingPath.c_str(), &legacyOutcome, &currentOutcome)
+        == LOGO_OFF_IN_JL_TEST_SUCCESS,
+        _T("欠落JLファイルの判定seamを実行できません"), diagnostic)) return false;
+    if (!Expect(legacyOutcome == LOGO_OFF_IN_JL_TEST_IO_ERROR
+        && currentOutcome == LOGO_OFF_IN_JL_TEST_IO_ERROR && legacyOutcome == currentOutcome,
+        _T("欠落JLファイルのIOExceptionが旧・現在で一致しません"), diagnostic)) return false;
+
+    legacyOutcome = 71;
+    currentOutcome = 72;
+    return Expect(CompareLogoOffInJLForTest(nullptr, &legacyOutcome, &currentOutcome)
+        == LOGO_OFF_IN_JL_TEST_INVALID_ARGUMENT
+        && legacyOutcome == 71 && currentOutcome == 72,
+        _T("null pathを不正引数として拒否できません"), diagnostic);
+}
 
 // LogoHeaderのコンストラクタはDLL外へ公開されないため、領域だけ確保して窓口で初期化する
 struct LogoHeaderStorage {
@@ -4129,6 +4850,11 @@ constexpr TestCase TEST_CASES[] = {
     { _T("audio_track_merge_planner"), TestAudioTrackMergePlanner },
     { _T("audio_silent_adts_bytes"), TestAudioSilentAdtsBytes },
     { _T("audio_channel_conversion"), TestAudioChannelConversion },
+    { _T("resume_dat_v5_wire_golden"), TestResumeDatV5WireGolden },
+    { _T("resume_dat_v5_logo_table_order_round_trip"), TestResumeDatV5LogoTableOrderRoundTrip },
+    { _T("resume_dat_v5_rejects_invalid_wire"), TestResumeDatV5RejectsInvalidWire },
+    { _T("resume_dat_logo_filename_rebase"), TestResumeDatLogoFilenameRebase },
+    { _T("cm_logo_off_in_jl_legacy_equivalence"), TestLogoOffInJLLegacyEquivalence },
     { _T("command_line_arguments"), TestCommandLineArguments },
     { _T("cm_cut_offset"), TestCMCutOffset },
     { _T("cm_cut_offset_command_line"), TestCMCutOffsetCommandLine },
