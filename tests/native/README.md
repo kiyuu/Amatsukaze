@@ -20,6 +20,16 @@ tests\native\build_windows.cmd
 
 利用可能なケースは `--list`、選択実行は `--select <ケース名>` を使います。複数の `--select` を指定できます。指定名の一つでも未登録なら終了コード2、ケース失敗は1です。
 
+**resume_dat_v5_wire_reference** はproduction writerの全byteを独立した222 byteの基準データと比較し、同じ基準データをreaderへ通してUTF-8日本語・非BMP basename、SHA-256、FILETIME、各種ID・packet/DRCS値、auto-detect設定、frame count、LogoFrameを確認します。reader→writer round-tripでも全byte一致を確認します。基準データの値は1-byte bool、int32/int64 little-endian、IEEE754 binary64を含みます。
+
+**resume_dat_v5_chapter_exe0_save_only** は、長さフィールドに続く生バイト列がv5末尾へ保存され、readerが構造を受理することを確認します。
+
+**resume_dat_v5_logo_table_order_round_trip** は通常候補→消去候補→video選択の初出順に作った複数entryを、candidate index・非重複scan range・選択なしvideoと合わせてreader→writerへ通し、全byteとbasename解決を確認します。**resume_dat_v5_rejects_invalid_wire** は不正UTF-8、埋め込みNUL・path成分、不正bool、切り詰め・余分な末尾byte、文字列/table/candidate/video/scan range/LogoFrameの上限超過、重複basename・candidate index、範囲外index、範囲の逆転・重複、selected logoとpayloadの不整合、負のframe/DRCS数、非有限PMT cut side rate、version不一致を拒否することを確認します。前の試用wire形式は互換対象にしません。**resume_dat_logo_filename_rebase** はbasenameから現在のlogo設定pathへの解決、SID-auto生成名、日本語basename、NULやpath成分、複数root、basename衝突・不一致、設定件数・順序、現在file欠落、root外symlink、追加ロゴ消し時のfallbackを確認します。symlink作成が可能な環境ではroot外targetも検証します。
+
+**cm_logo_off_in_jl_legacy_equivalence** は、旧 `logoOffInJL(videoFileIndex)` の処理を固定した基準実装と現在の `CMAnalyze::hasLogoOffInJL(setting_)` を、同じJLファイルで比較します。両方の結果を固定期待値とも照合し、コメント除去、大小文字、部分一致、CRLF、UTF-8 BOM、日本語、長い行、ファイル欠落時のIOExceptionを確認します。
+
+TSファイル横の Resume.dat はbasenameとSHA-256を持つlogo table、通常/消去候補index、videoごとの選択logo・走査範囲・LogoFrame bytesを保存します。再利用時は保存されたbasenameを現在のrootへ解決します。`--resume-dir` の一時manifestは別経路で、保存項目と復元動作は従来どおりです。
+
 `logo_background_retry` は、背景推定の救済探索を含む32画素AVX2処理をスカラー処理と比較します。半径1～32、上下左右の境界、乱数や単色などの入力、閾値境界について、有効画素マスクと背景値のビット一致を確認します。救済で最初に一致する辺の選択順、複数辺の平均、画像外の救済辺を飛ばす条件も固定値で検証します。AVX2非対応環境ではこのケースを省略します。
 
 ## 旧テストからの移行対応表

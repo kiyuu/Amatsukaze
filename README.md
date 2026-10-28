@@ -365,6 +365,16 @@ ver0.4.0.0よりエンコード設定はプロファイルに保存されます�
 プロファイルは`profile`フォルダに保存されます。
 他のAmatsukazeで保存したプロファイルを`profile`フォルダに入れてやればプロファイルが追加されて選べるようになります。
 
+#### 解析結果の保存・再利用
+
+現行ロゴpathは実行OSのfilesystem規則で解決するため、`./` や `../` を含む相対pathも使えます。指定pathから取得したbasenameを保持し、保存済みbasenameとは大文字・小文字も含めて一致を要求します。すべての設定ロゴは同じroot直下に解決できる必要があり、root外へ解決されるfile symlinkは通常解析へのfallbackになります。
+
+プロファイルの「解析結果を保存・再利用する」を有効にすると、対応するタスクで入力TSの隣に `Resume.dat` を保存し、次回は照合に一致した結果を再利用します。保存先は入力TSのファイル名に `.resume.dat` を付けたパスです。初期状態では無効です。コマンドラインの `--resume-dat` では保存先を指定できます。
+
+TSファイル横の `Resume.dat` はWindows/Linux共通のv5形式です。UTF-8文字列、固定幅little-endian整数、1 byteの真偽値、IEEE 754 binary64、FILETIMEの100 ns単位時刻で保存します。入力・設定の照合情報に加えて、basenameと実際に読み込んだlogo bytesのSHA-256を持つlogo table、通常/消去候補index、映像ごとのframe count・選択logo index・解析時の走査範囲・LogoFrame bytesを保存します。絶対ロゴパス、JLS/ChapterExeの結果、Trim/Divは保存しません。別OSで再利用するときは保存済みbasenameとhashを現在のロゴ設定に照合し、ロゴ設定と映像ロゴを現在のロゴrootへ解決します。追加ロゴ消し設定、複数root、名前の衝突・不一致、欠落・変更されたロゴファイルなどで照合できない場合は通常解析へ戻ります。
+
+`--resume-dir` は別の再開経路で、一時フォルダのmanifestに入力・設定の照合情報、映像ごとのframe countと選択ロゴpath、Trim/Divを保存します。この経路の保存項目と復元動作は従来どおりです。TSファイル横の `Resume.dat` を再利用して省略するのはロゴ解析のみです。無音・シーンチェンジ解析はChapterExeで実行し、CM解析ではjoin_logo_scpを実行してTrim・分割点・詳細ログを作成します。
+
 エンコード設定では、下記マクロが使用可能です。エンコード設定に記載すると、実行時に置き換えられて実行します。
 
 | マクロ                        | 説明 |
