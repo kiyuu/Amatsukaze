@@ -9,6 +9,7 @@
 #include "TranscodeManager.h"
 #include "rgy_util.h"
 #include "rgy_thread_affinity.h"
+#include <atomic>
 #include <thread>
 #include <condition_variable>
 #include <mutex>
@@ -21,6 +22,8 @@
 #include "Subtitle.h"
 #include "WaveWriter.h"
 #include <cmath>
+#include <cstring>
+#include <limits>
 #include "Mpeg2PartialEncode.h"
 #include "CaptionPgs.h"
 #include <filesystem>
@@ -43,7 +46,60 @@ struct WhisperAudioEntry {
     int dualMonoChannel; // -1: original stereo, 0/1: dual mono channel selection
 };
 
-constexpr int RESUME_MANIFEST_VERSION = 4;
+constexpr int RESUME_MANIFEST_VERSION = 5;
+// 前回の解析結果を再利用できるように保存する。
+constexpr int RESUME_DAT_PAYLOAD_SLOT_COUNT = 4;
+constexpr int64_t MAX_RESUME_DAT_PAYLOAD_SIZE = 64LL * 1024 * 1024;
+constexpr int64_t RESUME_DAT_BASE_VIDEO_RECORD_MIN_SIZE =
+    sizeof(int) + sizeof(int64_t) * 3;
+constexpr char RESUME_DAT_EXTENSION_HEADER_MAGIC[] = "AMT-RESUME-DAT";
+constexpr char RESUME_DAT_EXTENSION_FOOTER_MAGIC[] = "AMT-RESUME-END";
+constexpr int32_t RESUME_DAT_BASE_TERMINAL_SENTINEL = -1;
+
+struct ResumeDatPayload {
+    bool present = false;
+    std::vector<uint8_t> bytes;
+};
+
+struct ResumeDatVideoInfo {
+    ResumeDatPayload payloads[RESUME_DAT_PAYLOAD_SLOT_COUNT];
+    int numFrames = 0;
+    tstring logoPath;
+    std::vector<int> trims;
+    std::vector<int> divs;
+};
+
+struct ResumeDatInfo {
+    int64_t srcFileSize = 0;
+    int64_t srcWriteTime = 0;
+    int requestedServiceId = -1;
+    bool captionsParsed = false;
+    bool tsreplace = false;
+    bool chapter = false;
+    bool pmtCut = false;
+    double pmtCutSideRate[2] = {};
+    std::vector<tstring> logoPath;
+    std::vector<tstring> eraseLogoPath;
+    bool ignoreNoLogo = false;
+    bool noLogoInCM = false;
+    bool noDelogo = false;
+    bool looseLogoDetection = false;
+    int autoLogoDetect = 0;
+    int autoLogoDetectSearchFrames = 0;
+    int autoLogoDetectDivX = 0;
+    int autoLogoDetectDivY = 0;
+    int autoLogoDetectBlockSize = 0;
+    int autoLogoDetectThreshold = 0;
+    int autoLogoDetectMarginX = 0;
+    int autoLogoDetectMarginY = 0;
+    int serviceId = -1;
+    int64_t numTotalPackets = 0;
+    int64_t numScramblePackets = 0;
+    int64_t totalIntVideoSize = 0;
+    int64_t splitterSrcFileSize = 0;
+    int noDrcsMapCount = 0;
+    std::vector<ResumeDatVideoInfo> videos;
+};
 
 struct ResumeVideoInfo {
     int numFrames;
@@ -413,6 +469,356 @@ static ResumeInfo readResumeManifest(const tstring& path) {
     return info;
 }
 
+class ResumeDatReader {
+public:
+    ResumeDatReader(const File& file, const int64_t limit) : file_(file), limit_(limit) {
+        if (limit_ < file_.pos() || limit_ > file_.size()) {
+            THROW(FormatException, "再開データの読み取り範囲が不正です");
+        }
+    }
+
+    size_t read(MemoryChunk chunk) const {
+        const int64_t remaining = limit_ - file_.pos();
+        if (remaining < 0 || (uint64_t)chunk.length > (uint64_t)remaining) {
+            THROW(FormatException, "再開データの読み取り範囲を超えました");
+        }
+        const size_t bytesRead = file_.read(chunk);
+        if (bytesRead != chunk.length) {
+            THROW(FormatException, "再開データが途中で終わっています");
+        }
+        return bytesRead;
+    }
+
+    template<typename T>
+    T readValue() const {
+        T value;
+        if (read(MemoryChunk((uint8_t*)&value, sizeof(T))) != sizeof(T)) {
+            THROW(FormatException, "再開データが途中で終わっています");
+        }
+        return value;
+    }
+
+    int64_t pos() const { return file_.pos(); }
+    int64_t size() const { return limit_; }
+
+    void setLimit(const int64_t limit) {
+        if (limit < file_.pos() || limit > file_.size()) {
+            THROW(FormatException, "再開データの読み取り範囲が不正です");
+        }
+        limit_ = limit;
+    }
+
+private:
+    const File& file_;
+    int64_t limit_;
+};
+
+static int64_t getResumeDatRemainingBytes(const ResumeDatReader& reader) {
+    const int64_t remaining = reader.size() - reader.pos();
+    if (remaining < 0) {
+        THROW(FormatException, "再開データの位置が不正です");
+    }
+    return remaining;
+}
+
+static bool readResumeDatBool(const ResumeDatReader& reader) {
+    const uint8_t value = reader.readValue<uint8_t>();
+    if (value > 1) {
+        THROW(FormatException, "再開データの真偽値が不正です");
+    }
+    return value != 0;
+}
+
+static tstring readResumeDatTString(const ResumeDatReader& reader) {
+    const int64_t count = reader.readValue<int64_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (count < 0 || count > INT_MAX
+        || (uint64_t)count > (uint64_t)remaining / sizeof(tchar)) {
+        THROW(FormatException, "再開データの文字列サイズが不正です");
+    }
+    std::vector<tchar> chars((size_t)count);
+    const size_t byteCount = chars.size() * sizeof(tchar);
+    if (reader.read(MemoryChunk((uint8_t*)chars.data(), byteCount)) != byteCount) {
+        THROW(FormatException, "再開データの文字列が途中で終わっています");
+    }
+    return tstring(chars.begin(), chars.end());
+}
+
+static std::vector<tstring> readResumeDatTStringArray(const ResumeDatReader& reader) {
+    const int64_t count = reader.readValue<int64_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (count < 0 || count > INT_MAX
+        || (uint64_t)count > (uint64_t)remaining / sizeof(int64_t)) {
+        THROW(FormatException, "再開データの文字列配列数が不正です");
+    }
+    std::vector<tstring> strings;
+    strings.reserve((size_t)count);
+    for (int64_t index = 0; index < count; index++) {
+        strings.push_back(readResumeDatTString(reader));
+    }
+    return strings;
+}
+
+static std::vector<int> readResumeDatIntArray(const ResumeDatReader& reader) {
+    const int64_t count = reader.readValue<int64_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (count < 0
+        || (uint64_t)count > (uint64_t)std::numeric_limits<size_t>::max() / sizeof(int)
+        || count > remaining / (int64_t)sizeof(int)) {
+        THROW(FormatException, "再開データの配列サイズが不正です");
+    }
+    std::vector<int> values((size_t)count);
+    const size_t byteCount = values.size() * sizeof(int);
+    if (reader.read(MemoryChunk((uint8_t*)values.data(), byteCount)) != byteCount) {
+        THROW(FormatException, "再開データの配列が途中で終わっています");
+    }
+    return values;
+}
+
+static ResumeDatPayload readResumeDatPayload(const ResumeDatReader& reader) {
+    ResumeDatPayload payload;
+    const uint8_t present = reader.readValue<uint8_t>();
+    const int64_t byteCount = reader.readValue<int64_t>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (present > 1 || byteCount < 0 || byteCount > MAX_RESUME_DAT_PAYLOAD_SIZE
+        || byteCount > remaining || (present == 0 && byteCount != 0)) {
+        THROW(FormatException, "再開データの埋め込みファイルサイズが不正です");
+    }
+    payload.present = present != 0;
+    payload.bytes.resize((size_t)byteCount);
+    if (reader.read(MemoryChunk(payload.bytes.data(), payload.bytes.size())) != payload.bytes.size()) {
+        THROW(FormatException, "再開データの埋め込みファイルが途中で終わっています");
+    }
+    return payload;
+}
+
+static ResumeDatInfo readResumeDatHeader(const ResumeDatReader& reader) {
+    const int version = reader.readValue<int>();
+    if (version != RESUME_MANIFEST_VERSION) {
+        THROWF(FormatException, "Resume.dat形式のバージョンが未対応です: %d", version);
+    }
+
+    ResumeDatInfo info;
+    info.srcFileSize = reader.readValue<int64_t>();
+    info.srcWriteTime = reader.readValue<int64_t>();
+    info.requestedServiceId = reader.readValue<int>();
+    info.captionsParsed = readResumeDatBool(reader);
+    info.tsreplace = readResumeDatBool(reader);
+    info.chapter = readResumeDatBool(reader);
+    info.pmtCut = readResumeDatBool(reader);
+    info.pmtCutSideRate[0] = reader.readValue<double>();
+    info.pmtCutSideRate[1] = reader.readValue<double>();
+    info.logoPath = readResumeDatTStringArray(reader);
+    info.eraseLogoPath = readResumeDatTStringArray(reader);
+    info.ignoreNoLogo = readResumeDatBool(reader);
+    info.noLogoInCM = readResumeDatBool(reader);
+    info.noDelogo = readResumeDatBool(reader);
+    info.looseLogoDetection = readResumeDatBool(reader);
+    info.autoLogoDetect = reader.readValue<int>();
+    info.autoLogoDetectSearchFrames = reader.readValue<int>();
+    info.autoLogoDetectDivX = reader.readValue<int>();
+    info.autoLogoDetectDivY = reader.readValue<int>();
+    info.autoLogoDetectBlockSize = reader.readValue<int>();
+    info.autoLogoDetectThreshold = reader.readValue<int>();
+    info.autoLogoDetectMarginX = reader.readValue<int>();
+    info.autoLogoDetectMarginY = reader.readValue<int>();
+    info.serviceId = reader.readValue<int>();
+    info.numTotalPackets = reader.readValue<int64_t>();
+    info.numScramblePackets = reader.readValue<int64_t>();
+    info.totalIntVideoSize = reader.readValue<int64_t>();
+    info.splitterSrcFileSize = reader.readValue<int64_t>();
+    info.noDrcsMapCount = reader.readValue<int>();
+
+    const int videoCount = reader.readValue<int>();
+    const int64_t remaining = getResumeDatRemainingBytes(reader);
+    if (videoCount < 0 || videoCount > remaining / RESUME_DAT_BASE_VIDEO_RECORD_MIN_SIZE) {
+        THROW(FormatException, "再開データの映像数が不正です");
+    }
+    info.videos.resize((size_t)videoCount);
+    return info;
+}
+
+static bool readResumeDatFooter(
+    const File& file,
+    const int64_t fileSize,
+    int64_t& trailerLength,
+    int64_t& footerStart) {
+    constexpr int64_t FOOTER_SIZE = sizeof(int64_t) + sizeof(RESUME_DAT_EXTENSION_FOOTER_MAGIC) - 1;
+    if (fileSize < FOOTER_SIZE) {
+        return false;
+    }
+    footerStart = fileSize - FOOTER_SIZE;
+    file.seek(footerStart, SEEK_SET);
+    trailerLength = file.readValue<int64_t>();
+    char footerMagic[sizeof(RESUME_DAT_EXTENSION_FOOTER_MAGIC) - 1];
+    if (file.read(MemoryChunk((uint8_t*)footerMagic, sizeof(footerMagic))) != sizeof(footerMagic)) {
+        return false;
+    }
+    return std::memcmp(footerMagic, RESUME_DAT_EXTENSION_FOOTER_MAGIC, sizeof(footerMagic)) == 0;
+}
+
+static ResumeDatInfo readResumeDatManifest(const tstring& path) {
+    File file(path, _T("rb"));
+    const int64_t fileSize = file.size();
+    int64_t trailerLength = 0;
+    int64_t footerStart = 0;
+    if (!readResumeDatFooter(file, fileSize, trailerLength, footerStart)) {
+        THROW(FormatException, "Resume.datにextension footerがありません");
+    }
+
+    constexpr int64_t MIN_TRAILER_SIZE = sizeof(int32_t)
+        + sizeof(RESUME_DAT_EXTENSION_HEADER_MAGIC) - 1 + sizeof(int32_t) * 2;
+    if (trailerLength < MIN_TRAILER_SIZE || trailerLength > footerStart) {
+        THROW(FormatException, "Resume.datのextension長が不正です");
+    }
+    const int64_t trailerStart = footerStart - trailerLength;
+    file.seek(0, SEEK_SET);
+    ResumeDatReader reader(file, trailerStart);
+    ResumeDatInfo info = readResumeDatHeader(reader);
+    for (auto& video : info.videos) {
+        video.numFrames = reader.readValue<int>();
+        if (video.numFrames < 0) {
+            THROW(FormatException, "再開データのフレーム数が不正です");
+        }
+        video.logoPath = readResumeDatTString(reader);
+        video.trims = readResumeDatIntArray(reader);
+        video.divs = readResumeDatIntArray(reader);
+    }
+    if (reader.pos() != trailerStart) {
+        THROW(FormatException, "Resume.datのbase領域サイズが不正です");
+    }
+
+    reader.setLimit(footerStart);
+    if (reader.readValue<int32_t>() != RESUME_DAT_BASE_TERMINAL_SENTINEL) {
+        THROW(FormatException, "Resume.datのbase終端sentinelが不正です");
+    }
+    char headerMagic[sizeof(RESUME_DAT_EXTENSION_HEADER_MAGIC) - 1];
+    if (reader.read(MemoryChunk((uint8_t*)headerMagic, sizeof(headerMagic))) != sizeof(headerMagic)
+        || std::memcmp(headerMagic, RESUME_DAT_EXTENSION_HEADER_MAGIC, sizeof(headerMagic)) != 0) {
+        THROW(FormatException, "Resume.datのextension markerが不正です");
+    }
+    const int32_t payloadVideoCount = reader.readValue<int32_t>();
+    const int32_t payloadSlotCount = reader.readValue<int32_t>();
+    if (payloadVideoCount < 0 || (size_t)payloadVideoCount != info.videos.size()
+        || payloadSlotCount != RESUME_DAT_PAYLOAD_SLOT_COUNT) {
+        THROW(FormatException, "Resume.datのextension件数が不正です");
+    }
+    for (auto& video : info.videos) {
+        for (auto& payload : video.payloads) {
+            payload = readResumeDatPayload(reader);
+        }
+    }
+    if (reader.pos() != footerStart) {
+        THROW(FormatException, "Resume.datのextension長が一致しません");
+    }
+    if (file.size() != fileSize) {
+        THROW(FormatException, "Resume.datの読み込み中にファイルサイズが変化しました");
+    }
+    file.seek(footerStart, SEEK_SET);
+    const int64_t footerTrailerLength = file.readValue<int64_t>();
+    char footerMagic[sizeof(RESUME_DAT_EXTENSION_FOOTER_MAGIC) - 1];
+    if (footerTrailerLength != trailerLength
+        || file.read(MemoryChunk((uint8_t*)footerMagic, sizeof(footerMagic))) != sizeof(footerMagic)
+        || std::memcmp(footerMagic, RESUME_DAT_EXTENSION_FOOTER_MAGIC, sizeof(footerMagic)) != 0
+        || file.pos() != fileSize) {
+        THROW(FormatException, "Resume.datのextension footerが不正です");
+    }
+    return info;
+}
+
+static void writeResumeDatPayload(const File& manifest, const tstring& path) {
+    const bool present = File::exists(path);
+    manifest.writeValue(present);
+    if (!present) {
+        manifest.writeValue((int64_t)0);
+        return;
+    }
+
+    File input(path, _T("rb"));
+    const int64_t byteCount = input.size();
+    if (byteCount < 0 || byteCount > MAX_RESUME_DAT_PAYLOAD_SIZE) {
+        THROW(FormatException, "Resume.datに保存するファイルサイズが上限を超えています");
+    }
+    std::vector<uint8_t> bytes((size_t)byteCount);
+    if (input.read(MemoryChunk(bytes.data(), bytes.size())) != bytes.size()) {
+        THROW(IOException, "Resume.datに保存するファイルを読み込めません");
+    }
+    manifest.writeValue(byteCount);
+    manifest.write(MemoryChunk(bytes.data(), bytes.size()));
+}
+
+static void writeResumeDatManifest(
+    const File& file,
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo,
+    const std::vector<std::unique_ptr<CMAnalyze>>& cmanalyze,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    const auto pmtCutSideRate = setting.getPmtCutSideRate();
+    const auto srcPath = setting.getSrcFileOriginalPath();
+    file.writeValue(RESUME_MANIFEST_VERSION);
+    file.writeValue(srcFileSize);
+    file.writeValue(getFileWriteTime(srcPath));
+    file.writeValue(setting.getServiceId());
+    file.writeValue(captionsParsed);
+    file.writeValue(setting.getFormat() == FORMAT_TSREPLACE);
+    file.writeValue(setting.isChapterEnabled());
+    file.writeValue(setting.isPmtCutEnabled());
+    file.writeValue(pmtCutSideRate[0]);
+    file.writeValue(pmtCutSideRate[1]);
+    writeTStringArray(file, setting.getLogoPath());
+    writeTStringArray(file, setting.getEraseLogoPath());
+    file.writeValue(setting.isIgnoreNoLogo());
+    file.writeValue(setting.isNoLogoInCM());
+    file.writeValue(setting.isNoDelogo());
+    file.writeValue(setting.isLooseLogoDetection());
+    file.writeValue(setting.getAutoLogoDetect());
+    file.writeValue(setting.getAutoLogoDetectSearchFrames());
+    file.writeValue(setting.getAutoLogoDetectDivX());
+    file.writeValue(setting.getAutoLogoDetectDivY());
+    file.writeValue(setting.getAutoLogoDetectBlockSize());
+    file.writeValue(setting.getAutoLogoDetectThreshold());
+    file.writeValue(setting.getAutoLogoDetectMarginX());
+    file.writeValue(setting.getAutoLogoDetectMarginY());
+    file.writeValue(serviceId);
+    file.writeValue(numTotalPackets);
+    file.writeValue(numScramblePackets);
+    file.writeValue(totalIntVideoSize);
+    file.writeValue(srcFileSize);
+    file.writeValue(noDrcsMapCount);
+
+    file.writeValue((int)cmanalyze.size());
+    for (int videoFileIndex = 0; videoFileIndex < (int)cmanalyze.size(); videoFileIndex++) {
+        const auto& cma = cmanalyze[videoFileIndex];
+        const int numFrames = (int)reformInfo.getFilterSourceFrames(videoFileIndex).size();
+        file.writeValue(numFrames);
+        writeTString(file, cma->getLogoPath());
+        file.writeArray(cma->getTrims());
+        file.writeArray(cma->getDivs());
+    }
+
+    const int64_t trailerStart = file.pos();
+    file.writeValue(RESUME_DAT_BASE_TERMINAL_SENTINEL);
+    file.write(MemoryChunk((uint8_t*)RESUME_DAT_EXTENSION_HEADER_MAGIC,
+        sizeof(RESUME_DAT_EXTENSION_HEADER_MAGIC) - 1));
+    file.writeValue((int32_t)cmanalyze.size());
+    file.writeValue((int32_t)RESUME_DAT_PAYLOAD_SLOT_COUNT);
+    for (int videoFileIndex = 0; videoFileIndex < (int)cmanalyze.size(); videoFileIndex++) {
+        writeResumeDatPayload(file, setting.getTmpJlsPath(videoFileIndex));
+        writeResumeDatPayload(file, setting.getTmpLogoFramePath(videoFileIndex));
+        writeResumeDatPayload(file, setting.getTmpChapterExePath(videoFileIndex));
+        writeResumeDatPayload(file, setting.getTmpChapterExeOutPath(videoFileIndex));
+    }
+    file.writeValue(file.pos() - trailerStart);
+    file.write(MemoryChunk((uint8_t*)RESUME_DAT_EXTENSION_FOOTER_MAGIC,
+        sizeof(RESUME_DAT_EXTENSION_FOOTER_MAGIC) - 1));
+}
+
 static bool validateResumeSetting(const ConfigWrapper& setting, const ResumeInfo& info, tstring& reason) {
     std::vector<tstring> mismatchedFields;
     if (info.srcFileSize != getFileSize(setting.getSrcFilePath())
@@ -522,6 +928,211 @@ static bool validateResumeFiles(
         }
     }
     return true;
+}
+
+static bool validateResumeDatSettings(
+    const ConfigWrapper& setting,
+    const ResumeDatInfo& info,
+    StreamReformInfo& reformInfo,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed,
+    tstring& reason) {
+    std::vector<tstring> mismatchedFields;
+    auto addMismatch = [&](const tchar* field) {
+        mismatchedFields.push_back(field);
+    };
+    const auto srcPath = setting.getSrcFileOriginalPath();
+    if (info.srcFileSize != getFileSize(srcPath)
+        || info.srcWriteTime != getFileWriteTime(srcPath)) {
+        addMismatch(_T("入力TS"));
+    }
+    if (info.requestedServiceId != setting.getServiceId()) addMismatch(_T("要求サービスID"));
+    if (info.captionsParsed != captionsParsed) addMismatch(_T("字幕解析状態"));
+    if (info.tsreplace != (setting.getFormat() == FORMAT_TSREPLACE)) addMismatch(_T("TS置換出力"));
+    if (info.chapter != setting.isChapterEnabled()) addMismatch(_T("チャプター・CM解析"));
+    if (info.pmtCut != setting.isPmtCutEnabled()) addMismatch(_T("PMTカット"));
+    const auto pmtCutSideRate = setting.getPmtCutSideRate();
+    if (info.pmtCutSideRate[0] != pmtCutSideRate[0]
+        || info.pmtCutSideRate[1] != pmtCutSideRate[1]) {
+        addMismatch(_T("PMTカット割合"));
+    }
+    if (info.logoPath != setting.getLogoPath()) addMismatch(_T("ロゴ設定"));
+    if (info.eraseLogoPath != setting.getEraseLogoPath()) addMismatch(_T("追加ロゴ消し設定"));
+    if (info.ignoreNoLogo != setting.isIgnoreNoLogo()) addMismatch(_T("ロゴなし無視設定"));
+    if (info.noLogoInCM != setting.isNoLogoInCM()) addMismatch(_T("CM解析のロゴ使用設定"));
+    if (info.noDelogo != setting.isNoDelogo()) addMismatch(_T("ロゴ消し設定"));
+    if (info.looseLogoDetection != setting.isLooseLogoDetection()) addMismatch(_T("ロゴ検出しきい値設定"));
+    if (info.autoLogoDetect != setting.getAutoLogoDetect()) addMismatch(_T("自動ロゴ検出設定"));
+    if (info.autoLogoDetectSearchFrames != setting.getAutoLogoDetectSearchFrames()) addMismatch(_T("自動ロゴ検出検索フレーム数"));
+    if (info.autoLogoDetectDivX != setting.getAutoLogoDetectDivX()) addMismatch(_T("自動ロゴ検出分割数X"));
+    if (info.autoLogoDetectDivY != setting.getAutoLogoDetectDivY()) addMismatch(_T("自動ロゴ検出分割数Y"));
+    if (info.autoLogoDetectBlockSize != setting.getAutoLogoDetectBlockSize()) addMismatch(_T("自動ロゴ検出ブロックサイズ"));
+    if (info.autoLogoDetectThreshold != setting.getAutoLogoDetectThreshold()) addMismatch(_T("自動ロゴ検出しきい値"));
+    if (info.autoLogoDetectMarginX != setting.getAutoLogoDetectMarginX()) addMismatch(_T("自動ロゴ検出マージンX"));
+    if (info.autoLogoDetectMarginY != setting.getAutoLogoDetectMarginY()) addMismatch(_T("自動ロゴ検出マージンY"));
+    if (info.serviceId != serviceId) addMismatch(_T("実サービスID"));
+    if (info.numTotalPackets != numTotalPackets) addMismatch(_T("入力パケット数"));
+    if (info.numScramblePackets != numScramblePackets) addMismatch(_T("スクランブルパケット数"));
+    if (info.totalIntVideoSize != totalIntVideoSize) addMismatch(_T("映像サイズ"));
+    if (info.splitterSrcFileSize != srcFileSize || info.splitterSrcFileSize != info.srcFileSize) {
+        addMismatch(_T("TS解析サイズ"));
+    }
+    if (info.noDrcsMapCount != noDrcsMapCount) addMismatch(_T("DRCS未登録数"));
+    if (!mismatchedFields.empty()) {
+        reason = _T("Resume.datと解析条件が一致しません(");
+        for (size_t index = 0; index < mismatchedFields.size(); index++) {
+            if (index > 0) reason += _T(", ");
+            reason += mismatchedFields[index];
+        }
+        reason += _T(")");
+        return false;
+    }
+
+    // Resume.dat stores only one LogoFrame file; additional erase-logo frames cannot be restored.
+    if (!info.eraseLogoPath.empty()) {
+        reason = _T("Resume.dat形式に追加ロゴ消し用の解析フレームが含まれていません");
+        return false;
+    }
+    if ((int)info.videos.size() != reformInfo.getNumVideoFile()) {
+        reason = _T("Resume.datの映像数が一致しません");
+        return false;
+    }
+    for (int videoFileIndex = 0; videoFileIndex < reformInfo.getNumVideoFile(); videoFileIndex++) {
+        const auto& video = info.videos[videoFileIndex];
+        const int numFrames = (int)reformInfo.getFilterSourceFrames(videoFileIndex).size();
+        if (video.numFrames != numFrames) {
+            reason = StringFormat(_T("Resume.datのフレーム数が一致しません: %d"), videoFileIndex);
+            return false;
+        }
+        const bool chapterAnalysisRequired = setting.isChapterEnabled() && numFrames >= 300;
+        const bool logoConfigured = setting.getLogoPath().size() > 0
+            || setting.getEraseLogoPath().size() > 0;
+        const bool logoUsedInCM = chapterAnalysisRequired && logoConfigured
+            && !setting.isNoLogoInCM() && !CMAnalyze::hasLogoOffInJL(setting);
+        if (logoUsedInCM
+            && (video.logoPath.empty() || !video.payloads[1].present || video.payloads[1].bytes.empty())) {
+            reason = StringFormat(_T("Resume.datにCM解析用ロゴフレームがありません: %d"), videoFileIndex);
+            return false;
+        }
+        if (!video.logoPath.empty()) {
+            if (!setting.isNoDelogo() && !File::exists(video.logoPath)) {
+                reason = StringFormat(_T("Resume.datのロゴファイルがありません: %d"), videoFileIndex);
+                return false;
+            }
+            if (!setting.isNoDelogo()
+                && (!video.payloads[1].present || video.payloads[1].bytes.empty())) {
+                reason = StringFormat(_T("Resume.datにロゴ解析フレームがありません: %d"), videoFileIndex);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void restoreResumeDatLogoFrame(const ResumeDatPayload& payload, const tstring& path) {
+    if (!payload.present) {
+        if (File::exists(path)) {
+            rgy_file_remove(path.c_str());
+        }
+        return;
+    }
+    File output(path, _T("wb"));
+    output.write(MemoryChunk(const_cast<uint8_t*>(payload.bytes.data()), payload.bytes.size()));
+}
+
+static bool tryLoadResumeDat(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    ResumeDatInfo& info,
+    StreamReformInfo& reformInfo,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    const auto path = setting.getResumeDatPath();
+    if (path.empty()) {
+        return false;
+    }
+    try {
+        if (!File::exists(path)) {
+            ctx.infoF(_T("[Resume.dat再利用] ファイルがないため通常処理へ進みます: %s"), path.c_str());
+            return false;
+        }
+        info = readResumeDatManifest(path);
+        tstring reason;
+        if (!validateResumeDatSettings(setting, info, reformInfo,
+            serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize,
+            srcFileSize, noDrcsMapCount, captionsParsed, reason)) {
+            ctx.warnF(_T("[Resume.dat再利用] %s。通常処理へ戻ります"), reason.c_str());
+            return false;
+        }
+        for (int videoFileIndex = 0; videoFileIndex < (int)info.videos.size(); videoFileIndex++) {
+            const auto& video = info.videos[videoFileIndex];
+            restoreResumeDatLogoFrame(video.payloads[1], setting.getTmpLogoFramePath(videoFileIndex));
+        }
+        ctx.infoF(_T("[Resume.dat再利用] ロゴフレームを読み込みました: %s"), path.c_str());
+        return true;
+    } catch (const Exception& e) {
+        ctx.warnF(_T("[Resume.dat再利用] 読み込みに失敗したため通常処理へ戻ります: %s"), e.message());
+    } catch (const std::exception& e) {
+        ctx.warnF(_T("[Resume.dat再利用] 読み込みに失敗したため通常処理へ戻ります: %s"), char_to_tstring(e.what()));
+    }
+    return false;
+}
+
+static void saveResumeDatSidecar(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo,
+    const std::vector<std::unique_ptr<CMAnalyze>>& cmanalyze,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    const auto path = setting.getResumeDatPath();
+    if (path.empty()) {
+        return;
+    }
+    static std::atomic<uint64_t> stageSequence{ 0 };
+    const auto writingPath = StringFormat(_T("%s.%llu.%llu.writing"),
+        path.c_str(),
+        (unsigned long long)GetCurrentProcessId(),
+        (unsigned long long)stageSequence.fetch_add(1));
+    try {
+        {
+            File file(writingPath, _T("wb"));
+            writeResumeDatManifest(file, setting, reformInfo, cmanalyze,
+                serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize,
+                srcFileSize, noDrcsMapCount, captionsParsed);
+            file.flush();
+        }
+        readResumeDatManifest(writingPath);
+#ifdef _WIN32
+        if (!MoveFileEx(writingPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            THROWF(IOException, "Resume.datを置き換えられませんでした (error=%d)", (int)GetLastError());
+        }
+#else
+        std::filesystem::rename(writingPath, path);
+#endif
+        ctx.infoF(_T("[Resume.dat再利用] 解析結果を保存しました: %s"), path.c_str());
+    } catch (const Exception& e) {
+        rgy_file_remove(writingPath.c_str());
+        ctx.warnF(_T("[Resume.dat再利用] 保存に失敗しました: %s"), e.message());
+    } catch (const std::exception& e) {
+        rgy_file_remove(writingPath.c_str());
+        ctx.warnF(_T("[Resume.dat再利用] 保存に失敗しました: %s"), char_to_tstring(e.what()));
+    }
 }
 
 static bool tryLoadResume(
@@ -1731,6 +2342,10 @@ void DoBadThing() {
 
     int numVideoFiles = reformInfo.getNumVideoFile();
     int mainFileIndex = reformInfo.getMainVideoFileIndex();
+    ResumeDatInfo resumeDatInfo;
+    const bool isReusingResumeDat = !isReusingTmp && tryLoadResumeDat(ctx, setting,
+        resumeDatInfo, reformInfo, serviceId, numTotalPackets, numScramblePackets,
+        totalIntVideoSize, srcFileSize, noDrcsMapCount, captionsParsed);
     std::vector<std::unique_ptr<CMAnalyze>> cmanalyze;
 
     // ソースファイル読み込み用データ保存
@@ -1763,9 +2378,13 @@ void DoBadThing() {
     // ロゴ・CM解析
     if (!isReusingTmp) {
         rm.wait(HOST_CMD_CMAnalyze);
-        ctx.infoF(_T("[ロゴ・CM解析]"));
+        if (isReusingResumeDat) {
+            ctx.info(_T("[Resume.dat再利用] 選択済みロゴを再利用し、無音・シーンチェンジ解析とJLSを実行します"));
+        } else {
+            ctx.infoF(_T("[ロゴ・CM解析]"));
+        }
         sw.start();
-    } else {
+    } else if (isReusingTmp) {
         ctx.info(_T("[一時ファイル再利用] ロゴ・CM解析結果を再利用します"));
     }
     struct LogoMatchState {
@@ -1786,6 +2405,16 @@ void DoBadThing() {
         if (isReusingTmp) {
             const auto& resumeVideo = resumeInfo.videos[videoFileIndex];
             cma->restore(resumeVideo.logoPath, resumeVideo.trims, resumeVideo.divs, numFrames);
+        } else if (isReusingResumeDat) {
+            const auto& resumeVideo = resumeDatInfo.videos[videoFileIndex];
+            cma->restoreLogoResult(resumeVideo.logoPath);
+            const auto& inputVideofmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0)).videoFormat;
+            cma->analyzeResume(serviceId, videoFileIndex, inputVideofmt, numFrames, analyzeChapterAndCM);
+            if (analyzeChapterAndCM && setting.isPmtCutEnabled()) {
+                // 新しい解析結果からCM解析を再構築した後、通常解析と同じPMTカットを適用する。
+                cma->applyPmtCut(numFrames, setting.getPmtCutSideRate(),
+                    reformInfo.getPidChangedList(videoFileIndex));
+            }
         } else {
             const auto& inputVideofmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0)).videoFormat;
             if (analyzeChapterAndCM || delogoEnabled) {
@@ -1849,6 +2478,11 @@ void DoBadThing() {
 
     if (setting.isNoRemoveTmp()) {
         saveResumeFiles(ctx, setting, reformInfo, cmanalyze,
+            serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize, srcFileSize,
+            noDrcsMapCount, captionsParsed);
+    }
+    if (!isReusingTmp && !isReusingResumeDat) {
+        saveResumeDatSidecar(ctx, setting, reformInfo, cmanalyze,
             serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize, srcFileSize,
             noDrcsMapCount, captionsParsed);
     }

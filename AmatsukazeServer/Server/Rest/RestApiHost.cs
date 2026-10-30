@@ -1934,9 +1934,13 @@ namespace Amatsukaze.Server.Rest
                 {
                     return Results.BadRequest();
                 }
-                if (!trimAdjust.TryCreateSession(data, out var response, out var error))
+                if (!trimAdjust.TryCreateSession(data, out var response, out var error, out var errorCode))
                 {
-                    return Results.BadRequest(new { message = error ?? "カット調整セッションを作成できませんでした" });
+                    return Results.BadRequest(new
+                    {
+                        message = error ?? "カット調整セッションを作成できませんでした",
+                        errorCode
+                    });
                 }
                 return BuildMaybeGzippedJsonResult(request, response);
             });
@@ -2344,6 +2348,7 @@ namespace Amatsukaze.Server.Rest
                 ChangeItemType.ForceStart => "force",
                 ChangeItemType.RemoveSourceFile => "delete-source",
                 ChangeItemType.Move => "move",
+                ChangeItemType.ResetStateAndForceStart => "retry-force",
                 _ => "change"
             };
         }
