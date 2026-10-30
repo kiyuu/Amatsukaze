@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Amatsukaze.Shared
@@ -26,10 +27,14 @@ namespace Amatsukaze.Shared
         Task<ApiResult<bool>> CancelSleepAsync();
 
         Task<ApiResult<QueueView>> GetQueueAsync(QueueFilter? filter = null);
+        Task<ApiResult<QueueView>> GetQueueAsync(QueueFilter? filter, CancellationToken cancellationToken)
+            => GetQueueAsync(filter);
         Task<ApiResult<QueueChangesView>> GetQueueChangesAsync(long sinceVersion);
         Task<ApiResult<MessageChangesView>> GetMessageChangesAsync(long sinceId, string? page = null, string? requestId = null, string? levels = null, int max = 50);
         Task<ApiResult<string>> AddQueueAsync(AddQueueRequest req);
         Task<ApiResult<bool>> ChangeQueueAsync(ChangeItemData req);
+        Task<ApiResult<bool>> ChangeQueueAsync(ChangeItemData req, CancellationToken cancellationToken)
+            => ChangeQueueAsync(req);
         Task<ApiResult<bool>> MoveQueueManyAsync(QueueMoveManyRequest req);
         Task<ApiResult<bool>> PauseQueueAsync(PauseRequest req);
         Task<ApiResult<bool>> CancelAddQueueAsync();
@@ -102,6 +107,8 @@ namespace Amatsukaze.Shared
 
         // Trim調整
         Task<ApiResult<TrimAdjustSessionResponse>> CreateTrimSessionAsync(TrimAdjustSessionRequest req);
+        Task<ApiResult<TrimAdjustSessionResponse>> CreateTrimSessionAsync(TrimAdjustSessionRequest req, CancellationToken cancellationToken)
+            => CreateTrimSessionAsync(req);
         Task<ApiResult<byte[]>> GetTrimAudioAsync(string sessionId, int start, int end, System.Threading.CancellationToken cancellationToken = default);
 
         Task<ApiResult<TrimAdjustBundleResponse>> GetTrimBundleAsync(string sessionId, int frameNumber);

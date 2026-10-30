@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
 
 namespace Amatsukaze.Shared
 {
@@ -48,7 +49,8 @@ namespace Amatsukaze.Shared
         RemoveCompleted,
         ForceStart,
         RemoveSourceFile,
-        Move
+        Move,
+        ResetStateAndForceStart
     }
 
     public class ChangeItemData
@@ -58,9 +60,12 @@ namespace Amatsukaze.Shared
         public ChangeItemType ChangeType { get; set; }
         public int Priority { get; set; }
         public string? Profile { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         public ProcMode? Mode { get; set; }
         public int Position { get; set; }
         public string? RequestId { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public System.DateTime? ExpectedEncodeStart { get; set; }
     }
 
     public class PauseRequest

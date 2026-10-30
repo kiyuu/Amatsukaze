@@ -1013,13 +1013,16 @@ namespace Amatsukaze.Server
                         Util.AddLog(Id, "一時ファイル再利用用フォルダが見つからないため通常処理を実行します: " + item.ResumeDir, null);
                     }
                 }
+                string resumeDatPath = item.IsBatch || item.Mode == ProcMode.CMCheck
+                    ? item.SrcPath + ".resume.dat"
+                    : null;
 
                 string args = server.MakeAmatsukazeArgs(
                     item.Mode, profile,
                     server.AppData_.setting, workPath,
                     isMp4,
                     srcpath, srcpathOrg, localdst + ext, json, item.StreamFormat,
-                    item.ServiceId, logopaths, ignoreNoLogo, jlscmd, jlsopt, ceopt, trimavs, divfile, resumeDir, server.GetBatDirectoryPath(),
+                    item.ServiceId, logopaths, ignoreNoLogo, jlscmd, jlsopt, ceopt, trimavs, divfile, resumeDir, resumeDatPath, server.GetBatDirectoryPath(),
                     pipes?.InHandle, pipes?.OutHandle, Id);
                 string exename = server.AppData_.setting.AmatsukazePath;
 

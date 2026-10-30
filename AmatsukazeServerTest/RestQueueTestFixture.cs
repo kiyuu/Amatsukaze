@@ -39,6 +39,7 @@ internal sealed class RestQueueTestFixture
     // 補助APIの確認に必要な要求フラグと終了通知。フィールド名への依存をfixtureへ集約する。
     public bool AddQueueCanceled => (bool)GetField(Manager, "addQueueCanceled");
     public bool LogoRescanRequested => (bool)GetField(Server, "serviceListUpdated");
+    public void SetForceStartHandler(Action<QueueItem, Action> handler) => SetField(Manager, "forceStartItem", handler);
     public void SetFinishRequested(Action callback) => SetField(Server, "finishRequested", callback);
     // REST追加要求の変換だけを検証する。受信スレッドを起動せず、実TS解析には渡さない。
     public System.Threading.Tasks.Dataflow.BufferBlock<object> CaptureQueueRequests()
