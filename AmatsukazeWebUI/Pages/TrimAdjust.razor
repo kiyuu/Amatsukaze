@@ -1119,8 +1119,11 @@
                     return;
                 }
 
-                var recoveryChoice = await ShowMissingSourceRecoveryDialogAsync(
-                    result.Error, _queueItemSrcPath, sessionLoadToken);
+                var switchBatchToCmCheck = _queueItemMode is ProcMode.Batch or ProcMode.AutoBatch;
+                var recoveryChoice = switchBatchToCmCheck
+                    ? MissingSourceRecoveryChoice.Normal
+                    : await ShowMissingSourceRecoveryDialogAsync(
+                        result.Error, _queueItemSrcPath, sessionLoadToken);
                 sessionLoadToken.ThrowIfCancellationRequested();
                 if (_disposed) return;
                 if (recoveryChoice == MissingSourceRecoveryChoice.Cancel)
@@ -1135,10 +1138,12 @@
                     ? TrimAdjustRetryMode.ForceStart
                     : TrimAdjustRetryMode.Normal;
                 _retryWaiting = true;
-                _retryWaitMessage = "CM解析の完了を待っています。";
+                _retryWaitMessage = switchBatchToCmCheck
+                    ? "CM解析モードに切り替えて再実行しています。"
+                    : "CM解析の完了を待っています。";
                 _retryWaitModeText = recoveryChoice == MissingSourceRecoveryChoice.ForceStart
                     ? "強制実行で復元"
-                    : "通常復元";
+                    : switchBatchToCmCheck ? "CM解析モードへ切替" : "通常復元";
                 var retryWaitCts = CancellationTokenSource.CreateLinkedTokenSource(sessionLoadToken);
                 _retryWaitCts = retryWaitCts;
                 var retryWaitToken = retryWaitCts.Token;
@@ -1293,7 +1298,8 @@
     private bool CanRecoverMissingSourceCache()
     {
         return !_retryRecoveryStarted && _queueItemMode.HasValue &&
-            (_queueItemMode.Value == ProcMode.CMCheck || _queueItemMode.Value == ProcMode.TrimAdjust) &&
+            (_queueItemMode.Value == ProcMode.CMCheck || _queueItemMode.Value == ProcMode.TrimAdjust ||
+                _queueItemMode.Value == ProcMode.Batch || _queueItemMode.Value == ProcMode.AutoBatch) &&
             string.Equals(_queueItemState, "Complete", StringComparison.OrdinalIgnoreCase) &&
             _queueItemEncodeStart.HasValue;
     }
@@ -1301,11 +1307,7 @@
     private string GetMissingSourceRecoveryMessage(string? error)
     {
         var message = error ?? "amts0.datが見つかりません。";
-        if (_queueItemMode == ProcMode.Batch || _queueItemMode == ProcMode.AutoBatch)
-        {
-            return $"{message}\nバッチ/自動バッチ項目はフルエンコードを実行するため、この画面から再試行できません。キュー画面でCM解析モードを選択して再実行してください。";
-        }
-        return $"{message}\nキュー項目がCM解析/Trim調整の完了状態ではないため、自動再試行できません。キュー画面で状態を確認してください。";
+        return $"{message}\nキュー項目のモード、完了状態、または完了時刻を確認できないため、自動再試行できません。キュー画面で状態を確認してください。";
     }
 
     private void StopRetryWaiting()

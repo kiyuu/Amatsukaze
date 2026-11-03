@@ -92,13 +92,13 @@ public sealed class QueueManagerTests
     }
 
     [Fact]
-    public async Task 完了時刻が一致する条件付きリトライは同じCM解析項目をリセットする()
+    public async Task 完了時刻が一致する条件付きリトライはCM解析モードを適用する()
     {
         var fixture = new RestQueueTestFixture();
         var expectedStart = new DateTime(2026, 10, 28, 12, 30, 0, DateTimeKind.Utc);
         var profile = new ProfileSetting { Name = "標準", LastUpdate = DateTime.MinValue };
         var item = RestQueueTestFixture.Item(7, QueueState.Complete);
-        item.Mode = ProcMode.CMCheck;
+        item.Mode = ProcMode.Batch;
         item.ServiceId = -1;
         item.EncodeStart = expectedStart;
         item.ProfileName = profile.Name;
@@ -117,6 +117,7 @@ public sealed class QueueManagerTests
             ItemId = item.Id,
             ChangeType = ChangeItemType.ResetState,
             ExpectedEncodeStart = expectedStart,
+            Mode = ProcMode.CMCheck,
         });
 
         Assert.Same(item, Assert.Single(fixture.Manager.Queue));
@@ -136,6 +137,7 @@ public sealed class QueueManagerTests
         var fixture = new RestQueueTestFixture();
         var currentStart = new DateTime(2026, 10, 28, 12, 30, 0, DateTimeKind.Utc);
         var item = RestQueueTestFixture.Item(7, state);
+        item.Mode = ProcMode.Batch;
         item.EncodeStart = changeStart ? currentStart.AddMinutes(1) : currentStart;
         await fixture.Seed(item);
         var expectedStart = changeStart ? currentStart : currentStart.AddMinutes(1);
@@ -145,9 +147,11 @@ public sealed class QueueManagerTests
             ItemId = item.Id,
             ChangeType = ChangeItemType.ResetState,
             ExpectedEncodeStart = expectedStart,
+            Mode = ProcMode.CMCheck,
         });
 
         Assert.Equal(state, item.State);
+        Assert.Equal(ProcMode.Batch, item.Mode);
         Assert.Equal(item.EncodeStart, changeStart ? currentStart.AddMinutes(1) : currentStart);
         Assert.True(fixture.Store.GetLastOperationResult().IsFailed);
         Assert.Contains("キュー状態が変化", fixture.Store.GetLastOperationResult().Message);

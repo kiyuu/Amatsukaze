@@ -385,9 +385,37 @@ public sealed class TrimAdjustRetryWorkflowTests
     [Theory]
     [InlineData(ProcMode.Batch)]
     [InlineData(ProcMode.AutoBatch)]
-    public async Task バッチモードはフルエンコード再試行を送らない(ProcMode mode)
+    public async Task 完了済みバッチはCM解析へ切り替えて同じ項目を再試行する(ProcMode mode)
     {
-        var handler = new ScriptedHandler(new[] { Item("Complete", PreviousStart, mode) });
+        var handler = new ScriptedHandler(
+            new[] { Item("Complete", PreviousStart, mode) },
+            new[] { Item("LogoPending", null, ProcMode.CMCheck) },
+            new[] { Item("Complete", RetryStart, ProcMode.CMCheck) });
+        using var http = CreateHttpClient(handler);
+        var api = new AmatsukazeApi(http);
+
+        var result = await TrimAdjustRetryWorkflow.RecoverSessionAsync(api, 42, PreviousStart, 1,
+            TimeSpan.Zero, TimeSpan.FromMinutes(1), CancellationToken.None, CompleteWait);
+
+        Assert.True(result.CanCreateSession);
+        var change = Assert.Single(handler.Requests, request => request.Path == "/api/queue/change");
+        using (var body = JsonDocument.Parse(change.Body))
+        {
+            var root = body.RootElement;
+            Assert.Equal(42, GetProperty(root, "itemId").GetInt32());
+            Assert.Equal("ResetState", GetProperty(root, "changeType").GetString());
+            Assert.Equal(PreviousStart, GetProperty(root, "expectedEncodeStart").GetDateTime());
+            Assert.Equal("CMCheck", GetProperty(root, "mode").GetString());
+        }
+        Assert.Single(handler.Requests, request => request.Path == "/api/trim/sessions");
+    }
+
+    [Theory]
+    [InlineData(ProcMode.Batch)]
+    [InlineData(ProcMode.AutoBatch)]
+    public async Task 実行中のバッチは変更せず再試行要求を送らない(ProcMode mode)
+    {
+        var handler = new ScriptedHandler(new[] { Item("Encoding", null, mode) });
         using var http = CreateHttpClient(handler);
         var api = new AmatsukazeApi(http);
 
@@ -395,8 +423,25 @@ public sealed class TrimAdjustRetryWorkflowTests
             TimeSpan.Zero, TimeSpan.FromMinutes(1), CancellationToken.None, CompleteWait);
 
         Assert.Equal(TrimAdjustRetryStatus.BatchMode, result.Status);
-        Assert.Contains("キュー画面でCM解析モード", result.Message);
         Assert.DoesNotContain(handler.Requests, request => request.Path == "/api/queue/change");
+        Assert.DoesNotContain(handler.Requests, request => request.Path == "/api/trim/sessions");
+    }
+
+    [Theory]
+    [InlineData(ProcMode.Batch)]
+    [InlineData(ProcMode.AutoBatch)]
+    public async Task 完了時刻が変わったバッチは再投入もセッション作成もしない(ProcMode mode)
+    {
+        var handler = new ScriptedHandler(new[] { Item("Complete", RetryStart, mode) });
+        using var http = CreateHttpClient(handler);
+        var api = new AmatsukazeApi(http);
+
+        var result = await TrimAdjustRetryWorkflow.RecoverSessionAsync(api, 42, PreviousStart, 1,
+            TimeSpan.Zero, TimeSpan.FromMinutes(1), CancellationToken.None, CompleteWait);
+
+        Assert.Equal(TrimAdjustRetryStatus.InvalidState, result.Status);
+        Assert.DoesNotContain(handler.Requests, request => request.Path == "/api/queue/change");
+        Assert.DoesNotContain(handler.Requests, request => request.Path == "/api/trim/sessions");
     }
 
     [Fact]

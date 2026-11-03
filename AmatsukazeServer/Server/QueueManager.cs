@@ -1015,14 +1015,18 @@ namespace Amatsukaze.Server
                 if (target == null)
                 {
                     error = "指定されたアイテムが見つかりません";
+                    Util.AddLog($"[Queue] ExpectedEncodeStart retry rejected. ItemId={data.ItemId}, Item=missing, ExpectedEncodeStart={data.ExpectedEncodeStart.Value:O}", null);
                 }
                 else if (target.State != QueueState.Complete || target.IsActive ||
                     !MatchesExpectedEncodeStart(target.EncodeStart, data.ExpectedEncodeStart.Value))
                 {
+                    Util.AddLog($"[Queue] ExpectedEncodeStart retry rejected. ItemId={target.Id}, State={target.State}, IsActive={target.IsActive}, Mode={target.Mode}, EncodeStart={target.EncodeStart:O}, ExpectedEncodeStart={data.ExpectedEncodeStart.Value:O}", null);
                     error = "キュー状態が変化したためリトライを受け付けません。キュー画面で最新状態を確認してください";
                 }
                 else
                 {
+                    var previousMode = target.Mode;
+                    var previousEncodeStart = target.EncodeStart;
                     try
                     {
                         RestoreMovedInputFiles(target, false);
@@ -1035,6 +1039,7 @@ namespace Amatsukaze.Server
                     if (restoreError == null)
                     {
                         ApplyResetStateItem(target, data, waits);
+                        Util.AddLog($"[Queue] ExpectedEncodeStart retry accepted. ItemId={target.Id}, State=Complete-> {target.State}, EncodeStart={previousEncodeStart:O}->{target.EncodeStart:O}, Mode={previousMode}->{target.Mode}", null);
                     }
                 }
             }

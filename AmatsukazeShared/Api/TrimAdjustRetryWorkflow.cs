@@ -179,7 +179,10 @@ namespace Amatsukaze.Shared
                     return Result(TrimAdjustRetryStatus.QueueItemRemoved, "キューアイテムが削除されています。");
                 }
 
-                var modeError = CheckMode(item.Mode);
+                var switchBatchToCmCheck = IsBatchMode(item.Mode);
+                var modeError = switchBatchToCmCheck && IsComplete(item.State)
+                    ? null
+                    : CheckMode(item.Mode);
                 if (modeError != null) return modeError;
 
                 var terminal = CheckTerminalState(item.State, item.StateDetailText);
@@ -194,6 +197,11 @@ namespace Amatsukaze.Shared
                     }
                     if (item.EncodeStart.Value != expectedEncodeStart.Value)
                     {
+                        if (switchBatchToCmCheck)
+                        {
+                            return Result(TrimAdjustRetryStatus.InvalidState,
+                                "Batch/AutoBatch項目の完了時刻が変わっています。CM解析への切替は行わず、キュー状態を確認してください。");
+                        }
                         return Result(TrimAdjustRetryStatus.Ready, "別画面でのリトライが完了しています。");
                     }
                 }
@@ -215,7 +223,8 @@ namespace Amatsukaze.Shared
                         ChangeType = retryMode == TrimAdjustRetryMode.ForceStart
                             ? ChangeItemType.ResetStateAndForceStart
                             : ChangeItemType.ResetState,
-                        ExpectedEncodeStart = expectedEncodeStart.Value
+                        ExpectedEncodeStart = expectedEncodeStart.Value,
+                        Mode = switchBatchToCmCheck ? ProcMode.CMCheck : null,
                     }, cancellationToken);
                     cancellationToken.ThrowIfCancellationRequested();
                 }
@@ -291,10 +300,10 @@ namespace Amatsukaze.Shared
 
         private static TrimAdjustRetryResult? CheckMode(ProcMode mode)
         {
-            if (mode == ProcMode.Batch || mode == ProcMode.AutoBatch)
+            if (IsBatchMode(mode))
             {
                 return Result(TrimAdjustRetryStatus.BatchMode,
-                    "バッチ/自動バッチ項目はフルエンコードを実行するため、この画面から自動再試行できません。キュー画面でCM解析モードを選択して再実行してください。");
+                    "Batch/AutoBatch項目をCM解析へ切り替えて復旧できるのは、完了時刻を確認できる完了項目だけです。キュー状態を確認してください。");
             }
             if (mode != ProcMode.CMCheck && mode != ProcMode.TrimAdjust)
             {
@@ -303,6 +312,8 @@ namespace Amatsukaze.Shared
             }
             return null;
         }
+
+        private static bool IsBatchMode(ProcMode mode) => mode == ProcMode.Batch || mode == ProcMode.AutoBatch;
 
         private static TrimAdjustRetryResult? CheckTerminalState(string? state, string? detail)
         {
