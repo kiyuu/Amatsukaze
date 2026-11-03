@@ -1338,6 +1338,15 @@ namespace Amatsukaze.Server.Rest
             {
                 return null;
             }
+            // 実行後バッチ中は今回の履歴がまだ登録されていない。
+            // 開始日時があるキューは今回のログだけを参照し、古いキャッシュへ戻らない。
+            if (item.EncodeStart != DateTime.MinValue)
+            {
+                var path = item.IsCheck
+                    ? encodeServer.GetCheckLogFileBase(item.EncodeStart) + ".txt"
+                    : encodeServer.GetLogFileBase(item.EncodeStart) + ".txt";
+                return File.Exists(path) ? path : null;
+            }
             if (item.IsCheck)
             {
                 var check = FindCheckLog(item);
@@ -1352,16 +1361,6 @@ namespace Amatsukaze.Server.Rest
                 if (log != null)
                 {
                     return encodeServer.GetLogFileBase(log.EncodeStartDate) + ".txt";
-                }
-            }
-            if (item.EncodeStart != DateTime.MinValue)
-            {
-                var path = item.IsCheck
-                    ? encodeServer.GetCheckLogFileBase(item.EncodeStart) + ".txt"
-                    : encodeServer.GetLogFileBase(item.EncodeStart) + ".txt";
-                if (File.Exists(path))
-                {
-                    return path;
                 }
             }
             return null;
