@@ -226,6 +226,12 @@ namespace Amatsukaze.Server
         // アイテムを１つだけ強制的に開始する
         public void ForceStart(QueueItem item)
         {
+            ForceStart(item, null);
+        }
+
+        // キューへの所有権移譲を呼び出し元へ通知してから、非同期実行を開始する。
+        public void ForceStart(QueueItem item, Action onAccepted)
+        {
             if (MaintenancePaused)
             {
                 throw new InvalidOperationException("更新の適用中のため開始できません");
@@ -246,6 +252,7 @@ namespace Amatsukaze.Server
                 parking.Remove(idleWorker.Id);
             }
             Queue.StartItem(item);
+            onAccepted?.Invoke();
             RunItem(idleWorker, item, true);
         }
     }

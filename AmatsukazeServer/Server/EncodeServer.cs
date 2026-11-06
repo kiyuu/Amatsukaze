@@ -2062,7 +2062,7 @@ namespace Amatsukaze.Server
             string src, string srcOrg, string dst, string json,
             VideoStreamFormat streamFormat,
             int serviceId, string[] logofiles,
-            bool ignoreNoLogo, string jlscommand, string jlsopt, string ceopt, string trimavs, string divfile, string resumeDir, string batDir,
+            bool ignoreNoLogo, string jlscommand, string jlsopt, string ceopt, string trimavs, string divfile, string resumeDir, string resumeDatPath, string batDir,
             string inHandle, string outHandle, int pid)
         {
             if ((mode != ProcMode.CMCheck && mode != ProcMode.TrimAdjust) && mode != ProcMode.DrcsCheck && profile != null)
@@ -2599,6 +2599,10 @@ namespace Amatsukaze.Server
                 if (string.IsNullOrEmpty(resumeDir) == false)
                 {
                     sb.Append(" --resume-dir \"").Append(resumeDir).Append("\"");
+                }
+                if (profile.EnableAnalysisReuse && string.IsNullOrEmpty(resumeDatPath) == false)
+                {
+                    sb.Append(" --resume-dat \"").Append(resumeDatPath).Append("\"");
                 }
                 if (AppData_.setting.ExclusiveBatExec)
                 {
@@ -4125,7 +4129,12 @@ namespace Amatsukaze.Server
 
         internal void ForceStartItem(QueueItem item)
         {
-            workerPool.ForceStart(item);
+            ForceStartItem(item, null);
+        }
+
+        internal void ForceStartItem(QueueItem item, Action onAccepted)
+        {
+            workerPool.ForceStart(item, onAccepted);
         }
 
         // 新しいサービスを登録

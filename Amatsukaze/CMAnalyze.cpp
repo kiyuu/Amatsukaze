@@ -60,6 +60,13 @@ CMAnalyze::CMAnalyze(AMTContext& ctx,
     setting_(setting),
     logoAnalysisDone(false),
     logopath(),
+    resumeDatLogoReuse(),
+    resumeDatLogoCacheAttempted(false),
+    resumeDatLogoCacheHit(false),
+    resumeDatLogoAnalysisAttempted(false),
+    logoLoadHashes(),
+    selectedLogoLoadHash(),
+    logoScanRanges(),
     logoMatchFailKind(LogoMatchFailKind::None),
     logoMatchFailMessage(),
     trims(),
@@ -96,7 +103,7 @@ void CMAnalyze::analyze(const int serviceId, const int videoFileIndex, const Vid
     // チャプター・CM解析
     if (analyzeChapterAndCM) {
         ctx.infoF(_T("チャプター・CM解析開始"));
-        const bool noLogoInCM = setting_.isNoLogoInCM() || logoOffInJL(videoFileIndex);
+        const bool noLogoInCM = setting_.isNoLogoInCM() || hasLogoOffInJL(setting_);
         if (noLogoInCM) {
             ctx.info(_T("チャプター・CM解析にロゴを使用しません。"));
         } else {
@@ -135,7 +142,7 @@ void CMAnalyze::analyzeLogo(const int serviceId, const int videoFileIndex, const
     }
 }
 
-void CMAnalyze::analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath) {
+void CMAnalyze::analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath, const bool useLogoInCM) {
     // チャプター解析
     ctx.info(_T("[無音・シーンチェンジ解析]"));
     sw.start();
@@ -148,7 +155,7 @@ void CMAnalyze::analyzeChapterCM(const int serviceId, const int videoFileIndex, 
     // CM推定
     ctx.info(_T("[CM解析]"));
     sw.start();
-    joinLogoScp(videoFileIndex, serviceId);
+    joinLogoScp(videoFileIndex, serviceId, useLogoInCM);
     ctx.infoF(_T("完了: %.2f秒"), sw.getAndReset());
 
     ctx.info(_T("[CM解析結果 - TrimAVS]"));
@@ -345,6 +352,7 @@ void CMAnalyze::restore(const tstring& logoPath, const std::vector<int>& trims, 
         makeCMZones(numFrames);
     }
 }
+
 CMAnalyze::MySubProcess::MySubProcess(const tstring& args, File* out, File* err)
     : EventBaseSubProcess(args)
     , out(out)
@@ -402,12 +410,102 @@ int CMAnalyze::getPreferredThreads(const int processorCount) const {
 }
 
 void CMAnalyze::logoFrame(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const tstring& avspath) {
+    resumeDatLogoAnalysisAttempted = true;
     const auto& logoPath = setting_.getLogoPath();
     const auto& eraseLogoPath = setting_.getEraseLogoPath();
 
+    logoScanRanges.clear();
+    if (!trims.empty() && (trims.size() % 2) == 0) {
+        for (size_t index = 0; index < trims.size(); index += 2) {
+            const int32_t start = std::max(0, trims[index]);
+            const int32_t endExclusive = std::min(numFrames, trims[index + 1]);
+            if (start < endExclusive) {
+                logoScanRanges.push_back({ start, endExclusive });
+            }
+        }
+        if (logoScanRanges.empty()) {
+            // LogoFrameは有効範囲が空なら全映像を走査する。
+            logoScanRanges.clear();
+        }
+    }
+
     std::vector<tstring> allLogoPath = logoPath;
     allLogoPath.insert(allLogoPath.end(), eraseLogoPath.begin(), eraseLogoPath.end());
-    logo::LogoFrame logof(ctx, allLogoPath, 0.35f);
+    const bool captureLogoHashes = !setting_.getResumeDatPath().empty();
+    logo::LogoFrame logof(ctx, allLogoPath, 0.35f, captureLogoHashes);
+    logoLoadHashes = logof.getLoadedHashes();
+    selectedLogoLoadHash = {};
+
+    if (captureLogoHashes && resumeDatLogoReuse.hasCachedCandidateData) {
+        resumeDatLogoCacheAttempted = true;
+        tstring missReason;
+        auto setMiss = [&](const TCHAR* reason) {
+            if (missReason.empty()) missReason = reason;
+        };
+        if (!resumeDatLogoReuse.hasSelectedLogo) {
+            setMiss(_T("保存結果に選択済みロゴがありません"));
+        } else if (resumeDatLogoReuse.selectedLogoPath.empty()
+            || resumeDatLogoReuse.logoFrameBytes.empty()) {
+            setMiss(_T("保存済みロゴパスまたはLogoFrameがありません"));
+        } else if (resumeDatLogoReuse.scanRanges != logoScanRanges) {
+            setMiss(_T("実際のロゴ走査範囲が一致しません"));
+        } else if (resumeDatLogoReuse.detectionLogoHashes.size() != logoPath.size()
+            || resumeDatLogoReuse.eraseLogoHashes.size() != eraseLogoPath.size()
+            || logoLoadHashes.size() != allLogoPath.size()) {
+            setMiss(_T("ロゴ候補数が一致しません"));
+        }
+        if (missReason.empty()) {
+            for (size_t index = 0; index < allLogoPath.size(); index++) {
+                const auto& actual = logoLoadHashes[index];
+                const auto& expected = index < logoPath.size()
+                    ? resumeDatLogoReuse.detectionLogoHashes[index]
+                    : resumeDatLogoReuse.eraseLogoHashes[index - logoPath.size()];
+                if (!actual.available) {
+                    setMiss(_T("現在のロゴ候補をLogoData::Loadで読み込めません"));
+                    break;
+                }
+                if (actual.sha256 != expected) {
+                    setMiss(_T("ロゴ候補のSHA-256が一致しません"));
+                    break;
+                }
+            }
+        }
+        if (missReason.empty()) {
+            try {
+                logo::LogoHeader selectedHeader;
+                logo::LogoLoadHash selectedHash = {};
+                const auto selectedData = logo::LogoData::Load(
+                    resumeDatLogoReuse.selectedLogoPath, &selectedHeader, &selectedHash);
+                (void)selectedData;
+                if (!selectedHash.available) {
+                    setMiss(_T("選択済みロゴのSHA-256を取得できません"));
+                } else if (selectedHash.sha256 != resumeDatLogoReuse.selectedLogoHash) {
+                    setMiss(_T("選択済みロゴのSHA-256が一致しません"));
+                } else {
+                    File cachedLogoFrame(setting_.getTmpLogoFramePath(videoFileIndex), _T("wb"));
+                    cachedLogoFrame.write(MemoryChunk(
+                        const_cast<uint8_t*>(resumeDatLogoReuse.logoFrameBytes.data()),
+                        resumeDatLogoReuse.logoFrameBytes.size()));
+                    cachedLogoFrame.flush();
+                    logopath = resumeDatLogoReuse.selectedLogoPath;
+                    selectedLogoLoadHash = selectedHash;
+                    resumeDatLogoCacheHit = true;
+                    logoAnalysisDone = true;
+                    ctx.infoF(_T("[Resume.dat再利用] 映像%d: hit (選択済みロゴとLogoFrame、SHA-256、走査範囲が一致)"),
+                        videoFileIndex + 1);
+                    return;
+                }
+            } catch (const Exception& e) {
+                rgy_file_remove(setting_.getTmpLogoFramePath(videoFileIndex).c_str());
+                missReason = StringFormat(_T("保存済み選択ロゴを読み込めません: %s"), e.message());
+            } catch (const std::exception& e) {
+                rgy_file_remove(setting_.getTmpLogoFramePath(videoFileIndex).c_str());
+                missReason = StringFormat(_T("保存済み選択ロゴを読み込めません: %s"), char_to_tstring(e.what()).c_str());
+            }
+        }
+        ctx.infoF(_T("[Resume.dat再利用] 映像%d: miss (%s)。通常のロゴ解析を実行します"),
+            videoFileIndex + 1, missReason.c_str());
+    }
 
     if (trims.size() > 0 && (trims.size() % 2) == 0) {
         ctx.infoF(_T("解析範囲"));
@@ -519,6 +617,10 @@ void CMAnalyze::logoFrame(const int serviceId, const int videoFileIndex, const V
             }
         } else {
             logopath = setting_.getLogoPath()[logof.getBestLogo()];
+            const int selectedIndex = logof.getBestLogo();
+            if (selectedIndex >= 0 && static_cast<size_t>(selectedIndex) < logoLoadHashes.size()) {
+                selectedLogoLoadHash = logoLoadHashes[selectedIndex];
+            }
             ctx.infoF(_T("選択したロゴ: %s (一致率: %.2f)"), logopath.c_str(), logof.getLogoRatio());
         }
     }
@@ -594,7 +696,8 @@ bool CMAnalyze::tryAutoDetectAndRetryLogo(const int serviceId, const int videoFi
 
         ctx.info(_T("[自動ロゴ検出] 仮ロゴで再解析を開始します"));
         std::vector<tstring> autoLogoPathVec = { tmpLogoPath };
-        logo::LogoFrame autoLogof(ctx, autoLogoPathVec, 0.35f);
+        const bool captureLogoHashes = !setting_.getResumeDatPath().empty();
+        logo::LogoFrame autoLogof(ctx, autoLogoPathVec, 0.35f, captureLogoHashes);
 
         int duration = 0;
         std::atomic<int> startThreads = 0;
@@ -711,6 +814,9 @@ bool CMAnalyze::tryAutoDetectAndRetryLogo(const int serviceId, const int videoFi
 
         autoLogof.writeResult(setting_.getTmpLogoFramePath(videoFileIndex));
         logopath = savedLogoPath;
+        if (!autoLogof.getLoadedHashes().empty()) {
+            selectedLogoLoadHash = autoLogof.getLoadedHashes().front();
+        }
         cleanup();
         return true;
     } catch (const Exception& e) {
@@ -753,10 +859,10 @@ void CMAnalyze::chapterExe(int videoFileIndex, const VideoFormat& inputFormat, c
     }
 }
 
-tstring CMAnalyze::MakeJoinLogoScpArgs(int videoFileIndex) {
+tstring CMAnalyze::MakeJoinLogoScpArgs(int videoFileIndex, const bool useLogoInCM) {
     StringBuilderT sb;
     sb.append(_T("\"%s\""), setting_.getJoinLogoScpPath());
-    if (logopath.size() > 0) {
+    if (useLogoInCM && logopath.size() > 0) {
         sb.append(_T(" -inlogo \"%s\""), pathToOS(setting_.getTmpLogoFramePath(videoFileIndex)));
     }
     sb.append(_T(" -inscp \"%s\" -incmd \"%s\" -o \"%s\" -oscp \"%s\" -odiv \"%s\" %s"),
@@ -769,8 +875,8 @@ tstring CMAnalyze::MakeJoinLogoScpArgs(int videoFileIndex) {
     return sb.str();
 }
 
-void CMAnalyze::joinLogoScp(int videoFileIndex, int serviceId) {
-    auto args = MakeJoinLogoScpArgs(videoFileIndex);
+void CMAnalyze::joinLogoScp(int videoFileIndex, int serviceId, const bool useLogoInCM) {
+    auto args = MakeJoinLogoScpArgs(videoFileIndex, useLogoInCM);
     ctx.infoF(_T("%s"), args);
     // join_logo_scp向けの環境変数を設定
     const tstring clioutpath = setting_.getOutFileBaseWithoutPrefix() + _T(".") + setting_.getOutputExtention(setting_.getFormat());
@@ -871,8 +977,8 @@ void CMAnalyze::readSceneChanges(int videoFileIndex) {
     THROW(FormatException, "ChapterExe.exeの標準出力・標準エラー出力から解析結果が読めません");
 }
 
-bool CMAnalyze::logoOffInJL(const int videoFileIndex) const {
-    File file(setting_.getJoinLogoScpCmdPath(), _T("r"));
+bool CMAnalyze::hasLogoOffInJL(const ConfigWrapper& setting) {
+    File file(setting.getJoinLogoScpCmdPath(), _T("r"));
     std::string str;
     while (file.getline(str)) {
         // str の # 以降は削除する (コメント)

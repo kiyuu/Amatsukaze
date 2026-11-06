@@ -1961,11 +1961,13 @@ int __stdcall logo::AMTEraseLogo::SetCacheHints(int cachehints, int frame_range)
 }
 
 // 絶対値<0.2fは不明とみなす
-logo::LogoFrame::LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio) :
+logo::LogoFrame::LogoFrame(
+    AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio, const bool captureHashes) :
     AMTObject(ctx),
     numLogos((int)logofiles.size()),
     logoArr(logofiles.size()),
     deintArr(logofiles.size()),
+    loadedHashes(logofiles.size()),
     maxYSize(0),
     numFrames(0),
     framesPerSec(0),
@@ -1977,7 +1979,13 @@ logo::LogoFrame::LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofile
     for (int i = 0; i < (int)logofiles.size(); i++) {
         try {
             LogoHeader header;
-            logoArr[i] = LogoDataParam(LogoData::Load(logofiles[i], &header), &header);
+            LogoLoadHash contentHash = {};
+            logo::LogoData logoData = LogoData::Load(logofiles[i], &header,
+                captureHashes ? &contentHash : nullptr);
+            if (captureHashes) {
+                loadedHashes[i] = contentHash;
+            }
+            logoArr[i] = LogoDataParam(std::move(logoData), &header);
             deintArr[i] = LogoDataParam(LogoData(header.w, header.h, header.logUVx, header.logUVy), &header);
             DeintLogo(deintArr[i], logoArr[i], header.w, header.h);
             deintArr[i].CreateLogoMask(maskratio);
