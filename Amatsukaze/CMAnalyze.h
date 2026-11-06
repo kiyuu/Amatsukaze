@@ -14,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <regex>
+#include <array>
 
 #include "StreamUtils.h"
 #include "TranscodeSetting.h"
@@ -62,18 +63,37 @@ enum class LogoMatchFailKind {
     AutoOther,
 };
 
+// Resume.datから渡す、映像ごとのロゴ解析再利用候補。
+struct ResumeDatLogoReuseData {
+    bool hasCachedCandidateData = false;
+    bool hasSelectedLogo = false;
+    tstring selectedLogoPath;
+    logo::LogoContentHash selectedLogoHash = {};
+    std::vector<logo::LogoContentHash> detectionLogoHashes;
+    std::vector<logo::LogoContentHash> eraseLogoHashes;
+    std::vector<uint8_t> logoFrameBytes;
+    std::vector<std::pair<int32_t, int32_t>> scanRanges;
+};
+
 class CMAnalyze : public AMTObject {
 public:
     CMAnalyze(AMTContext& ctx,
         const ConfigWrapper& setting);
 
     void analyze(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const bool analyzeChapterAndCM);
+    void setResumeDatLogoReuse(ResumeDatLogoReuseData data) { resumeDatLogoReuse = std::move(data); }
+    bool didResumeDatLogoCacheMiss() const { return resumeDatLogoCacheAttempted && !resumeDatLogoCacheHit; }
+    bool didAttemptResumeDatLogoAnalysis() const { return resumeDatLogoAnalysisAttempted; }
+    static bool hasLogoOffInJL(const ConfigWrapper& setting);
 
     const tstring& getLogoPath() const { return logopath; }
     const tstring& getLogoMatchFailMessage() const { return logoMatchFailMessage; }
     const std::vector<int>& getTrims() const { return trims; }
     const std::vector<EncoderZone>& getZones() const { return cmzones; }
     const std::vector<int>& getDivs() const { return divs; }
+    const std::vector<logo::LogoLoadHash>& getLogoLoadHashes() const { return logoLoadHashes; }
+    const logo::LogoLoadHash& getSelectedLogoLoadHash() const { return selectedLogoLoadHash; }
+    const std::vector<std::pair<int32_t, int32_t>>& getLogoScanRanges() const { return logoScanRanges; }
 
     // PMT変更情報からCM追加認識
     void applyPmtCut(
@@ -99,6 +119,13 @@ private:
 
     bool logoAnalysisDone;
     tstring logopath;
+    ResumeDatLogoReuseData resumeDatLogoReuse;
+    bool resumeDatLogoCacheAttempted;
+    bool resumeDatLogoCacheHit;
+    bool resumeDatLogoAnalysisAttempted;
+    std::vector<logo::LogoLoadHash> logoLoadHashes;
+    logo::LogoLoadHash selectedLogoLoadHash;
+    std::vector<std::pair<int32_t, int32_t>> logoScanRanges;
     LogoMatchFailKind logoMatchFailKind;
     tstring logoMatchFailMessage;
 
@@ -110,7 +137,7 @@ private:
 
     void analyzeLogo(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
 
-    void analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
+    void analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath, const bool useLogoInCM = true);
 
     tstring makeAVSFile(int videoFileIndex, const VideoFormat& inputFormat, const bool forChapterExe);
 
@@ -127,17 +154,15 @@ private:
 
     void chapterExe(int videoFileIndex, const VideoFormat& inputFormat, const tstring& avspath);
 
-    tstring MakeJoinLogoScpArgs(int videoFileIndex);
+    tstring MakeJoinLogoScpArgs(int videoFileIndex, const bool useLogoInCM);
 
-    void joinLogoScp(int videoFileIndex, int serviceId);
+    void joinLogoScp(int videoFileIndex, int serviceId, const bool useLogoInCM);
 
     void readTrimAVS(int videoFileIndex, int numFrames);
 
     void readTrimAVS(std::string str, int numFrames);
 
     void readDiv(int videoFileIndex, int numFrames);
-
-    bool logoOffInJL(const int videoFileIndex) const;
 
     bool readSceneChangesFromFile(const tstring& path);
 

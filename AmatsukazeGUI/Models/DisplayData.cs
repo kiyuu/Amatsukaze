@@ -2559,6 +2559,18 @@ namespace Amatsukaze.Models
         }
         #endregion
 
+        #region EnableAnalysisReuse変更通知プロパティ
+        public bool EnableAnalysisReuse {
+            get { return Data.EnableAnalysisReuse; }
+            set {
+                if (Data.EnableAnalysisReuse == value)
+                    return;
+                Data.EnableAnalysisReuse = value;
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
+
         #region DisableLogFile変更通知プロパティ
         public bool DisableLogFile {
             get { return Data.DisableLogFile; }

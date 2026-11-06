@@ -16,8 +16,16 @@
 #include "CoreUtils.hpp"
 #include "FileUtils.h"
 #include "logo.h"
+#include <array>
 
 namespace logo {
+
+using LogoContentHash = std::array<uint8_t, 32>;
+
+struct LogoLoadHash {
+    bool available = false;
+    LogoContentHash sha256 = {};
+};
 
 // 拡張ヘッダの識別値とバージョン
 constexpr int LOGO_EXTENDED_MAGIC = 0x12345;
@@ -84,7 +92,7 @@ public:
     void Save(const tstring& filepath, const LogoHeader* header);
     void SaveAviUtl(const tstring& filepath, const LogoHeader* header);
 
-    static LogoData Load(const tstring& filepath, LogoHeader* header);
+    static LogoData Load(const tstring& filepath, LogoHeader* header, LogoLoadHash* contentHash = nullptr);
 };
 
 } // namespace logo
