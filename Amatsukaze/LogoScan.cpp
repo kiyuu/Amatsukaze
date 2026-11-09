@@ -1961,11 +1961,17 @@ int __stdcall logo::AMTEraseLogo::SetCacheHints(int cachehints, int frame_range)
 }
 
 // 絶対値<0.2fは不明とみなす
-logo::LogoFrame::LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio) :
+logo::LogoFrame::LogoFrame(
+    AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio,
+    const bool captureHashes, const bool deferPreparation) :
     AMTObject(ctx),
     numLogos((int)logofiles.size()),
     logoArr(logofiles.size()),
     deintArr(logofiles.size()),
+    loadedHashes(logofiles.size()),
+    loadedHeaders(deferPreparation ? logofiles.size() : 0),
+    maskRatio(maskratio),
+    logoDataPrepared(false),
     maxYSize(0),
     numFrames(0),
     framesPerSec(0),
@@ -1977,16 +1983,47 @@ logo::LogoFrame::LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofile
     for (int i = 0; i < (int)logofiles.size(); i++) {
         try {
             LogoHeader header;
-            logoArr[i] = LogoDataParam(LogoData::Load(logofiles[i], &header), &header);
-            deintArr[i] = LogoDataParam(LogoData(header.w, header.h, header.logUVx, header.logUVy), &header);
-            DeintLogo(deintArr[i], logoArr[i], header.w, header.h);
-            deintArr[i].CreateLogoMask(maskratio);
-
-            int YSize = header.w * header.h;
-            maxYSize = std::max(maxYSize, YSize);
+            LogoLoadHash contentHash = {};
+            logo::LogoData logoData = LogoData::Load(logofiles[i], &header,
+                captureHashes ? &contentHash : nullptr);
+            if (captureHashes) {
+                loadedHashes[i] = contentHash;
+            }
+            logoArr[i] = LogoDataParam(std::move(logoData), &header);
+            if (deferPreparation) {
+                loadedHeaders[i] = header;
+            } else {
+                prepareLogoData(i, header);
+            }
         } catch (const IOException&) {
             // 読み込みエラーは無視
         }
+    }
+    logoDataPrepared = !deferPreparation;
+}
+
+void logo::LogoFrame::prepareLogoData() {
+    if (logoDataPrepared) {
+        return;
+    }
+    for (int i = 0; i < numLogos; i++) {
+        if (!logoArr[i].isValid()) {
+            continue;
+        }
+        prepareLogoData(i, loadedHeaders[i]);
+    }
+    logoDataPrepared = true;
+}
+
+// 責務: Resume.datのhit確認後に走査が必要な場合だけ、ロゴ評価データを初期化する。
+void logo::LogoFrame::prepareLogoData(const int index, const LogoHeader& header) {
+    try {
+        deintArr[index] = LogoDataParam(LogoData(header.w, header.h, header.logUVx, header.logUVy), &header);
+        DeintLogo(deintArr[index], logoArr[index], header.w, header.h);
+        deintArr[index].CreateLogoMask(maskRatio);
+        maxYSize = std::max(maxYSize, header.w * header.h);
+    } catch (const IOException&) {
+        deintArr[index] = LogoDataParam();
     }
 }
 

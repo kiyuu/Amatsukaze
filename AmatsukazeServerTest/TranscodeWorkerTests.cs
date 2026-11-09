@@ -46,4 +46,17 @@ public class TranscodeWorkerTests
         Assert.Equal("output/program-cm.log",
             TranscodeWorker.GetOutputLogPath(ProcMode.CMCheck, "output/program", true, true));
     }
+
+    [Theory]
+    [InlineData(ProcMode.Batch, @"C:\input\program.ts.resume.dat")]
+    [InlineData(ProcMode.AutoBatch, @"C:\input\program.ts.resume.dat")]
+    [InlineData(ProcMode.CMCheck, @"C:\input\program.ts.resume.dat")]
+    [InlineData(ProcMode.TrimAdjust, @"C:\input\program.ts.resume.dat")]
+    [InlineData(ProcMode.Test, null)]
+    public void GetResumeDatPath_ReturnsPathNextToSourceFileForSupportedModes(ProcMode mode, string? expectedPath)
+    {
+        var item = new QueueItem { Mode = mode, SrcPath = @"C:\input\program.ts" };
+
+        Assert.Equal(expectedPath, TranscodeWorker.GetResumeDatPath(item));
+    }
 }
