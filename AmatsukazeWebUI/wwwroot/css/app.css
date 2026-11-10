@@ -2078,8 +2078,7 @@ code {
     background: var(--backdrop);
 }
 
-.source-recovery-dialog,
-.source-recovery-waiting-panel {
+.source-recovery-dialog {
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-lg);
     background: var(--bg-surface);
@@ -2094,16 +2093,14 @@ code {
     padding: 1.25rem;
 }
 
-.source-recovery-dialog-heading,
-.source-recovery-waiting-heading {
+.source-recovery-dialog-heading {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 0.75rem;
 }
 
-.source-recovery-dialog-heading h2,
-.source-recovery-waiting-heading h2 {
+.source-recovery-dialog-heading h2 {
     margin: 0;
     color: var(--text);
     font-size: 1.2rem;
@@ -2263,64 +2260,6 @@ code {
     color: var(--muted);
 }
 
-.source-recovery-waiting-panel {
-    width: min(500px, calc(100% - 2rem));
-    margin: 2rem auto;
-    padding: 1.25rem;
-}
-
-.source-recovery-waiting-scroll {
-    flex: 1 1 auto;
-    min-width: 0;
-    min-height: 0;
-    overflow-y: auto;
-    overscroll-behavior-y: contain;
-}
-
-.source-recovery-waiting-heading {
-    justify-content: flex-start;
-}
-
-.source-recovery-waiting-heading h2 {
-    margin-bottom: 0.25rem;
-}
-
-.source-recovery-waiting-icon {
-    display: grid;
-    flex: 0 0 2.4rem;
-    width: 2.4rem;
-    height: 2.4rem;
-    place-items: center;
-    border-radius: 50%;
-    background: var(--accent-soft);
-    color: var(--accent-strong);
-    font-size: 1.2rem;
-}
-
-.source-recovery-waiting-title {
-    margin: 0;
-    font-weight: 600;
-}
-
-.source-recovery-caption {
-    margin: 0.1rem 0 0;
-}
-
-.source-recovery-waiting-copy {
-    margin: 1rem 0 0;
-    color: var(--muted);
-}
-
-.source-recovery-notice {
-    margin: 0.8rem 0 0;
-    padding: 0.65rem 0.75rem;
-    border: 1px solid color-mix(in srgb, var(--update-warning-text) 35%, transparent);
-    border-radius: var(--radius-sm);
-    background: var(--update-warning-bg);
-    color: var(--update-warning-text);
-    font-size: 0.82rem;
-}
-
 .source-recovery-focus-sentinel {
     position: fixed;
     width: 1px;
@@ -2334,23 +2273,17 @@ code {
     white-space: nowrap;
 }
 
-.source-recovery-dialog button:focus-visible,
-.source-recovery-waiting-panel button:focus-visible {
+.source-recovery-dialog button:focus-visible {
     outline: none;
     box-shadow: var(--focus-ring);
 }
 
 @media (max-width: 480px) {
-    .source-recovery-dialog,
-    .source-recovery-waiting-panel {
+    .source-recovery-dialog {
         padding: 1rem;
     }
 
     .source-recovery-dialog {
         width: calc(100vw - 1rem);
-    }
-
-    .source-recovery-waiting-panel {
-        width: calc(100% - 1rem);
     }
 }

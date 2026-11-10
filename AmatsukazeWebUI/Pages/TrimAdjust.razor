@@ -7,9 +7,10 @@
 @using System.Threading.Tasks
 @inject IAmatsukazeApi Api
 @inject IJSRuntime JS
+@inject NavigationManager Nav
 @implements IAsyncDisposable
 
-<div class="trim-adjust-page" @onkeydown="OnKeyDown" @onkeydown:preventDefault="@(!_retryWaiting && _missingSourceRecoveryChoice == null)" tabindex="0" @ref="_pageRef">
+<div class="trim-adjust-page" @onkeydown="OnKeyDown" @onkeydown:preventDefault="@(_missingSourceRecoveryChoice == null)" tabindex="0" @ref="_pageRef">
     <div class="trim-toolbar">
         <button class="trim-btn trim-btn-sm" @onclick="ShowCheckLog" title="CM解析チェックログ">ログ</button>
         <button class="trim-btn trim-btn-sm @(_showJls && HasJlsSegments ? "trim-btn-active" : "")" @onclick="ToggleShowJls"
@@ -52,30 +53,7 @@
 
     @if (_loading)
     {
-        @if (_retryWaiting)
-        {
-            <div class="source-recovery-waiting-scroll">
-                <section class="source-recovery-waiting-panel" role="status" aria-live="polite">
-                    <div class="source-recovery-waiting-heading">
-                        <span class="source-recovery-waiting-icon" aria-hidden="true">⌛</span>
-                        <div>
-                            <h2>カット調整データの復元</h2>
-                            <p class="source-recovery-waiting-title">@_retryWaitMessage</p>
-                            <p class="source-recovery-caption">@_retryWaitModeText</p>
-                        </div>
-                    </div>
-                    <p class="source-recovery-waiting-copy">解析が完了すると、カット調整画面を開きます。</p>
-                    <p class="source-recovery-notice">待機を終了しても、キューの処理は継続します。</p>
-                    <div class="source-recovery-actions">
-                        <button class="source-recovery-button" type="button" @onclick="StopRetryWaiting">待機を終了</button>
-                    </div>
-                </section>
-            </div>
-        }
-        else
-        {
-            <div class="trim-loading"><span>読み込み中...</span></div>
-        }
+        <div class="trim-loading"><span>読み込み中...</span></div>
     }
     else if (!string.IsNullOrEmpty(_errorMessage))
     {
@@ -556,6 +534,7 @@
                     ? "Batch/AutoBatch項目を同じキュー項目のままカット調整モードへ切り替え、元の録画からカット調整データを復元します。"
                     : "カット調整用のデータが見つからないため、元の録画をカット調整モードで処理して復元します。")
             </p>
+            <p class="source-recovery-dialog-copy">再試行を送るとキュー画面へ戻り、解析完了後にカット調整画面が開きます。</p>
             @if (!string.IsNullOrWhiteSpace(_missingSourceRecoveryPath))
             {
                 <div class="source-recovery-file">
@@ -713,9 +692,6 @@
     private bool _isFrameLoading; // データ取得中フラグ（画像イベントには依存しない）
     private bool _disposed;
     private bool _retryRecoveryStarted;
-    private bool _retryWaiting;
-    private string? _retryWaitMessage;
-    private string? _retryWaitModeText;
     private TaskCompletionSource<MissingSourceRecoveryChoice>? _missingSourceRecoveryChoice;
     private bool _missingSourceRecoveryIsBatch;
     private string? _missingSourceRecoveryError;
@@ -724,7 +700,6 @@
     private bool _restorePageFocusAfterRecoveryOnRender;
     private ElementReference _missingSourceRecoveryCancelRef;
     private ElementReference _missingSourceRecoveryCloseRef;
-    private CancellationTokenSource? _retryWaitCts;
     private CancellationTokenSource? _sessionLoadCts;
 
     private string _prevThumbUrl = "";
@@ -1143,67 +1118,29 @@
                     return;
                 }
 
-                var retryMode = recoveryChoice switch
-                {
-                    MissingSourceRecoveryChoice.ForceStart when !switchBatchToTrimAdjust => TrimAdjustRetryMode.ForceStart,
-                    MissingSourceRecoveryChoice.ForceStart => TrimAdjustRetryMode.SwitchBatchToTrimAdjustAndForceStart,
-                    MissingSourceRecoveryChoice.Normal when switchBatchToTrimAdjust => TrimAdjustRetryMode.SwitchBatchToTrimAdjust,
-                    _ => TrimAdjustRetryMode.Normal,
-                };
-                var batchModeSwitchConfirmed = switchBatchToTrimAdjust;
                 var forceStartRequested = recoveryChoice == MissingSourceRecoveryChoice.ForceStart;
-                _retryWaiting = true;
-                _retryWaitMessage = batchModeSwitchConfirmed
-                    ? $"同じキュー項目をカット調整モードへ切り替え、{(forceStartRequested ? "強制開始" : "開始")}を確認しています。開始後は完了を待ちます。"
-                    : $"{(forceStartRequested ? "カット調整モードの強制実行" : "カット調整モード")}の開始を確認しています。開始後は完了を待ちます。";
-                _retryWaitModeText = batchModeSwitchConfirmed
-                    ? $"カット調整モードへ切替（{(forceStartRequested ? "強制実行" : "通常実行")}）"
-                    : forceStartRequested ? "強制実行で復元" : "通常復元";
-                var retryWaitCts = CancellationTokenSource.CreateLinkedTokenSource(sessionLoadToken);
-                _retryWaitCts = retryWaitCts;
-                var retryWaitToken = retryWaitCts.Token;
-                StateHasChanged();
-
-                TrimAdjustRetryResult retryResult;
-                try
+                _retryRecoveryStarted = true;
+                var retryResult = await Api.ChangeQueueAsync(new ChangeItemData
                 {
-                    _retryRecoveryStarted = true;
-                    retryResult = await TrimAdjustRetryWorkflow.RecoverSessionAsync(
-                        Api, QueueItemId, _queueItemEncodeStart, _previewScaleMode, retryMode, retryWaitToken);
-                }
-                finally
-                {
-                    _retryWaiting = false;
-                    _retryWaitMessage = null;
-                    _retryWaitModeText = null;
-                    if (ReferenceEquals(_retryWaitCts, retryWaitCts))
-                    {
-                        _retryWaitCts = null;
-                    }
-                    retryWaitCts.Dispose();
-                }
-
+                    ItemId = QueueItemId,
+                    ChangeType = forceStartRequested
+                        ? ChangeItemType.ResetStateAndForceStart
+                        : ChangeItemType.ResetState,
+                    ExpectedEncodeStart = _queueItemEncodeStart,
+                    Mode = ProcMode.TrimAdjust
+                }, sessionLoadToken);
                 sessionLoadToken.ThrowIfCancellationRequested();
                 if (_disposed) return;
-                if (retryWaitToken.IsCancellationRequested)
+                if (!retryResult.Ok || retryResult.Data != true)
                 {
-                    _errorMessage = "待機を終了しました。キューの処理は継続しています。";
-                    _loading = false;
-                    StateHasChanged();
-                    return;
-                }
-                if (!retryResult.CanCreateSession)
-                {
-                    _errorMessage = retryResult.Message ?? "カット調整データを復元できませんでした。";
+                    _retryRecoveryStarted = false;
+                    _errorMessage = retryResult.Error ?? "キューの再試行を受け付けられませんでした。キュー画面で状態を確認してください。";
                     _loading = false;
                     StateHasChanged();
                     return;
                 }
 
-                await LoadQueueItemInfoAsync(sessionLoadToken);
-                sessionLoadToken.ThrowIfCancellationRequested();
-                if (_disposed) return;
-                await InitializeTrimSessionAsync(retryResult.Session!, sessionLoadToken);
+                Nav.NavigateTo("/queue");
                 return;
             }
             else if (!result.Ok || result.Data == null)
@@ -1325,11 +1262,6 @@
     {
         var message = error ?? "amts0.datが見つかりません。";
         return $"{message}\nキュー項目のモード、完了状態、または実行開始時刻を確認できないため、自動再試行できません。キュー画面で状態を確認してください。";
-    }
-
-    private void StopRetryWaiting()
-    {
-        if (!_disposed) _retryWaitCts?.Cancel();
     }
 
     private async Task InitializeTrimSessionAsync(
@@ -2793,7 +2725,7 @@
 
     private void OnKeyDown(KeyboardEventArgs e)
     {
-        if (_disposed || _retryWaiting || _missingSourceRecoveryChoice != null) return;
+        if (_disposed || _missingSourceRecoveryChoice != null) return;
 
         var shortcut = BuildShortcutFromEvent(e);
         if (!string.IsNullOrEmpty(shortcut) && _commandByShortcut.TryGetValue(shortcut, out var commandId))
@@ -2997,7 +2929,6 @@
     {
         _disposed = true;
         _sessionLoadCts?.Cancel();
-        _retryWaitCts?.Cancel();
         await DisposeAudioAsync();
         Interlocked.Increment(ref _bundleRequestToken);
         Interlocked.Exchange(ref _thumbRequestToken, _bundleRequestToken);
