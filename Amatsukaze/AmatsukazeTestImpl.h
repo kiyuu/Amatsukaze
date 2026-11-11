@@ -12,6 +12,48 @@
 #include "TranscodeManager.h"
 #include "LogoScan.h"
 
+// Resume.dat v5のnative regression seam。Resume.dat由来のbasename出力はUTF-8、path引数はnative tchar。
+extern "C" AMATSUKAZE_API int WriteResumeDatSampleForTest(const tchar* path);
+extern "C" AMATSUKAZE_API int WriteResumeDatSampleWithChapterExe0ForTest(
+    const tchar* path, const tchar* chapterExePath);
+extern "C" AMATSUKAZE_API int ReadResumeDatManifestForTest(
+    const tchar* path,
+    char* settingsLogoFilenameUtf8, size_t settingsLogoFilenameCapacity,
+    char* videoLogoFilenameUtf8, size_t videoLogoFilenameCapacity,
+    int64_t* sourceFileSize, int64_t* sourceWriteTimeFileTime,
+    int32_t* requestedServiceId, int32_t* serviceId, int32_t* videoFrameCount,
+    uint8_t* logoFrameBytes, size_t logoFrameCapacity, size_t* logoFrameSize);
+extern "C" AMATSUKAZE_API int RoundTripResumeDatForTest(const tchar* sourcePath, const tchar* outputPath);
+extern "C" AMATSUKAZE_API int RebaseResumeDatLogoPathsForTest(
+    const tchar* const* savedLogoFilenames, size_t savedLogoFilenameCount,
+    const tchar* const* currentLogoPaths, size_t currentLogoPathCount,
+    const tchar* const* videoLogoFilenames, size_t videoLogoFilenameCount,
+    const tchar* eraseLogoPath, char* outputUtf8, size_t outputUtf8Capacity,
+    size_t* outputUtf8Length);
+extern "C" AMATSUKAZE_API int ValidateResumeDatLogoFilenameForTest(const tchar* filename, size_t filenameLength);
+
+enum LogoOffInJLForTestOutcome {
+    LOGO_OFF_IN_JL_TEST_NO_MATCH = 0,
+    LOGO_OFF_IN_JL_TEST_MATCH = 1,
+    LOGO_OFF_IN_JL_TEST_IO_ERROR = 2,
+    LOGO_OFF_IN_JL_TEST_UNEXPECTED_ERROR = 3,
+};
+enum LogoOffInJLForTestStatus {
+    LOGO_OFF_IN_JL_TEST_SUCCESS = 0,
+    LOGO_OFF_IN_JL_TEST_INVALID_ARGUMENT = -1,
+    LOGO_OFF_IN_JL_TEST_SETUP_ERROR = -2,
+};
+
+// 旧LogoOff判定と現在のproduction判定を同じJLファイルで比較するnative regression seam。
+extern "C" AMATSUKAZE_API int CompareLogoOffInJLForTest(
+    const tchar* commandPath, int* legacyOutcome, int* currentOutcome);
+
+// LogoFrameの通常生成と遅延生成における評価データ準備サイズを確認するnative regression seam。
+// 成功時0、引数不正時-1、その他の失敗時-2。
+extern "C" AMATSUKAZE_API int CheckLogoFramePreparationForTest(
+    const tchar* logoPath, int* eagerMaxYSize,
+    int* deferredMaxYSizeBefore, int* deferredMaxYSizeAfter);
+
 // ネイティブ単体テストからコマンドライン引数の解析結果を取得するためのC ABI (定義はAmatsukazeCLI.hpp)。
 // 結果は「キー=値」の改行区切りテキスト。成功時0、引数の拒否時1、想定外の例外時2、
 // 引数不正時-1、出力バッファ不足時-2 (outputLengthに終端を除く必要文字数) を返す。

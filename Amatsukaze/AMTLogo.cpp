@@ -9,6 +9,10 @@
 #include "AMTLogo.h"
 #include "rgy_util.h"
 #include "AviSynthWrapper.h"
+#include "ReaderWriterFFmpeg.h"
+extern "C" {
+#include <libavutil/sha.h>
+}
 
 logo::LogoHeader::LogoHeader() {}
 
@@ -229,15 +233,68 @@ void logo::LogoData::SaveAviUtl(const tstring& filepath, const LogoHeader* heade
     WriteBaseLogo(file, header, basedata.data());
 }
 
-/* static */ logo::LogoData logo::LogoData::Load(const tstring& filepath, LogoHeader* header) {
+/* static */ logo::LogoData logo::LogoData::Load(
+    const tstring& filepath, LogoHeader* header, LogoLoadHash* contentHash) {
     File file(filepath, _T("rb"));
+    AVSHA* sha = nullptr;
+    if (contentHash != nullptr) {
+        *contentHash = {};
+    }
+    bool hashAvailable = contentHash != nullptr;
+    if (contentHash != nullptr) {
+        sha = av_sha_alloc();
+        if (sha == nullptr || av_sha_init(sha, 256) < 0) {
+            av_free(sha);
+            sha = nullptr;
+            hashAvailable = false;
+        }
+    }
+    struct ShaGuard {
+        AVSHA* value;
+        ~ShaGuard() { av_free(value); }
+    } shaGuard{ sha };
+    auto hashBytes = [&](const uint8_t* bytes, const size_t byteCount) {
+        if (sha == nullptr) return;
+        size_t offset = 0;
+        constexpr size_t HASH_CHUNK_SIZE = 1024 * 1024;
+        while (offset < byteCount) {
+            const size_t chunk = std::min(HASH_CHUNK_SIZE, byteCount - offset);
+            av_sha_update(sha, bytes + offset, static_cast<unsigned int>(chunk));
+            offset += chunk;
+        }
+    };
+    auto readHashedValue = [&](auto& value) {
+        if (file.read(MemoryChunk(reinterpret_cast<uint8_t*>(&value), sizeof(value))) != sizeof(value)) {
+            THROW(IOException, "ロゴファイルのヘッダが途中で終わっています");
+        }
+        hashBytes(reinterpret_cast<const uint8_t*>(&value), sizeof(value));
+    };
 
-    // ベース部分をスキップ
-    file.readValue<LOGO_FILE_HEADER>();
-    LOGO_HEADER h = file.readValue<LOGO_HEADER>();
-    file.seek(LOGO_PIXELSIZE(&h), SEEK_CUR);
-
-    *header = file.readValue<LogoHeader>();
+    LOGO_FILE_HEADER fileHeader = {};
+    LOGO_HEADER h = {};
+    if (sha != nullptr) {
+        readHashedValue(fileHeader);
+        readHashedValue(h);
+        int64_t remainingBaseBytes = LOGO_PIXELSIZE(&h);
+        if (remainingBaseBytes < 0) {
+            THROW(FormatException, "ロゴファイルのベースデータサイズが不正です");
+        }
+        std::array<uint8_t, 64 * 1024> skipBuffer = {};
+        while (remainingBaseBytes > 0) {
+            const size_t chunk = static_cast<size_t>(std::min<int64_t>(remainingBaseBytes, skipBuffer.size()));
+            if (file.read(MemoryChunk(skipBuffer.data(), chunk)) != chunk) {
+                THROW(IOException, "ロゴファイルのベースデータが途中で終わっています");
+            }
+            hashBytes(skipBuffer.data(), chunk);
+            remainingBaseBytes -= static_cast<int64_t>(chunk);
+        }
+        readHashedValue(*header);
+    } else {
+        fileHeader = file.readValue<LOGO_FILE_HEADER>();
+        h = file.readValue<LOGO_HEADER>();
+        file.seek(LOGO_PIXELSIZE(&h), SEEK_CUR);
+        *header = file.readValue<LogoHeader>();
+    }
 
     // 拡張部分の妥当性チェック (別形式や壊れたファイルの値で領域を確保しないように)
     if (header->magic != LOGO_EXTENDED_MAGIC || header->version < LOGO_EXTENDED_VERSION) {
@@ -255,8 +312,23 @@ void logo::LogoData::SaveAviUtl(const tstring& filepath, const LogoHeader* heade
     size_t sz = (header->w * header->h + wUV * hUV * 2) * 2;
 
     // 途中で切れたファイルを未初期化の係数で読み込まないよう、読めたサイズを確認する
-    if (file.read(MemoryChunk((uint8_t*)logo.data.get(), sz * sizeof(float))) != sz * sizeof(float)) {
+    const size_t extendedDataBytes = sz * sizeof(float);
+    if (file.read(MemoryChunk((uint8_t*)logo.data.get(), extendedDataBytes)) != extendedDataBytes) {
         THROW(IOException, "ロゴファイルの係数データが不足しています");
+    }
+    hashBytes(reinterpret_cast<const uint8_t*>(logo.data.get()), extendedDataBytes);
+
+    if (sha != nullptr) {
+        std::array<uint8_t, 64 * 1024> trailingBuffer = {};
+        while (true) {
+            const size_t bytesRead = file.read(MemoryChunk(trailingBuffer.data(), trailingBuffer.size()));
+            if (bytesRead == 0) break;
+            hashBytes(trailingBuffer.data(), bytesRead);
+        }
+        av_sha_final(sha, contentHash->sha256.data());
+        contentHash->available = true;
+    } else if (contentHash != nullptr) {
+        contentHash->available = hashAvailable;
     }
 
     return logo;

@@ -7,6 +7,8 @@
 */
 
 #include "AmatsukazeTestImpl.h"
+#include "CMAnalyze.h"
+#include "FileUtils.h"
 #include "faad.h"
 #include <thread>
 #include <chrono>
@@ -1021,5 +1023,84 @@ extern "C" AMATSUKAZE_API int ApplyCMCutOffsetForTest(int frameCount,
         return 0;
     } catch (...) {
         return -1;
+    }
+}
+
+namespace {
+int evaluateLegacyLogoOffInJL(const tstring& commandPath) {
+    try {
+        // 旧実装 (26f97b130171d451170fe95de09308adac94780f) を独立した基準として固定する。
+        File file(commandPath, _T("r"));
+        std::string str;
+        while (file.getline(str)) {
+            auto pos = str.find('#');
+            if (pos != std::string::npos) {
+                str.erase(pos);
+            }
+            if (str.find("LogoOff") != std::string::npos) {
+                return LOGO_OFF_IN_JL_TEST_MATCH;
+            }
+        }
+        return LOGO_OFF_IN_JL_TEST_NO_MATCH;
+    } catch (const IOException&) {
+        return LOGO_OFF_IN_JL_TEST_IO_ERROR;
+    } catch (...) {
+        return LOGO_OFF_IN_JL_TEST_UNEXPECTED_ERROR;
+    }
+}
+
+int evaluateCurrentLogoOffInJL(const ConfigWrapper& setting) {
+    try {
+        return CMAnalyze::hasLogoOffInJL(setting)
+            ? LOGO_OFF_IN_JL_TEST_MATCH
+            : LOGO_OFF_IN_JL_TEST_NO_MATCH;
+    } catch (const IOException&) {
+        return LOGO_OFF_IN_JL_TEST_IO_ERROR;
+    } catch (...) {
+        return LOGO_OFF_IN_JL_TEST_UNEXPECTED_ERROR;
+    }
+}
+}
+
+extern "C" AMATSUKAZE_API int CompareLogoOffInJLForTest(
+    const tchar* commandPath, int* legacyOutcome, int* currentOutcome) {
+    if (commandPath == nullptr || legacyOutcome == nullptr || currentOutcome == nullptr) {
+        return LOGO_OFF_IN_JL_TEST_INVALID_ARGUMENT;
+    }
+    try {
+        AMTContext ctx;
+        Config config{};
+        config.encoderFilter = ENCODER_INVALID;
+        config.audioFormatChangeMode = AFC_SPLIT;
+        config.joinLogoScpCmdPath = commandPath;
+        ConfigWrapper setting(ctx, config);
+
+        *legacyOutcome = evaluateLegacyLogoOffInJL(commandPath);
+        *currentOutcome = evaluateCurrentLogoOffInJL(setting);
+        return LOGO_OFF_IN_JL_TEST_SUCCESS;
+    } catch (...) {
+        return LOGO_OFF_IN_JL_TEST_SETUP_ERROR;
+    }
+}
+
+extern "C" AMATSUKAZE_API int CheckLogoFramePreparationForTest(
+    const tchar* logoPath, int* eagerMaxYSize,
+    int* deferredMaxYSizeBefore, int* deferredMaxYSizeAfter) {
+    if (logoPath == nullptr || eagerMaxYSize == nullptr ||
+        deferredMaxYSizeBefore == nullptr || deferredMaxYSizeAfter == nullptr) {
+        return -1;
+    }
+    try {
+        AMTContext ctx;
+        const std::vector<tstring> logoFiles = { logoPath };
+        logo::LogoFrame eager(ctx, logoFiles, 0.35f, true, false);
+        logo::LogoFrame deferred(ctx, logoFiles, 0.35f, true, true);
+        *eagerMaxYSize = eager.getMaxYSize();
+        *deferredMaxYSizeBefore = deferred.getMaxYSize();
+        deferred.prepareLogoData();
+        *deferredMaxYSizeAfter = deferred.getMaxYSize();
+        return 0;
+    } catch (...) {
+        return -2;
     }
 }
