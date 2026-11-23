@@ -170,6 +170,7 @@ static void printHelp(const tchar* bin) {
         "  --no-remove-tmp     一時ファイルを削除せずに残す\n"
         "                      デフォルトは60fpsタイミングで生成\n"
         "  --resume-dir <パス> 保存済み一時フォルダを再利用する\n"
+        "  --resume-dat <パス> CM解析結果を保存・再利用する\n"
         "  --timefactor <数値>  x265やNVEncで疑似VFRレートコントロールするときの時間レートファクター[0.25]\n"
         "  --pmt-cut <数値>:<数値>  PMT変更でCM認識するときの最大CM認識時間割合。全再生時間に対する割合で指定する。\n"
         "                      例えば 0.1:0.2 とすると開始10%%までにPMT変更があった場合はそのPMT変更までをCM認識する。\n"
@@ -622,8 +623,9 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             conf.trimavsPath = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("--divfile")) {
             conf.divFilePath = pathNormalize(getParam(argc, argv, i++));
-        } else if (key == _T("--resume-dir")) {
-            conf.resumeDir = pathNormalize(getParam(argc, argv, i++));
+        } else if (key == _T("--resume-dir") || key == _T("--resume-dat")) {
+            tstring& resumePath = key == _T("--resume-dir") ? conf.resumeDir : conf.resumeDatPath;
+            resumePath = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("--copy-trimavs")) {
             conf.copyTrimAVS = true;
         } else if (key == _T("--nicoass")) {
@@ -891,6 +893,12 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
 
     if (conf.srcFilePathOrg.size() == 0) {
         conf.srcFilePathOrg = conf.srcFilePath;
+    }
+
+    if (!conf.resumeDatPath.empty()
+        && (rgy_path_is_same(conf.resumeDatPath, conf.srcFilePath)
+            || rgy_path_is_same(conf.resumeDatPath, conf.srcFilePathOrg))) {
+        THROW(ArgumentException, "再開情報の出力先に入力TSは指定できません");
     }
 
     return std::unique_ptr<ConfigWrapper>(new ConfigWrapper(ctx, conf));

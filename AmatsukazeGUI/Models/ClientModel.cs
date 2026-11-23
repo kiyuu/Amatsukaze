@@ -2147,6 +2147,7 @@ namespace Amatsukaze.Models
                 profile.MoveInputFile = !data.Profile.DisableMoveInputFile;
                 profile.MoveEDCBFiles = profile.MoveInputFile ? data.Profile.MoveEDCBFiles : false;
                 profile.NoRemoveTmp = data.Profile.NoRemoveTmp;
+                profile.EnableAnalysisReuse = data.Profile.EnableAnalysisReuse;
                 profile.DisableLogFile = data.Profile.DisableLogFile;
                 profile.EnableCMLogFile = data.Profile.EnableCMLogFile;
                 profile.SaveProfileText = data.Profile.SaveProfileText;

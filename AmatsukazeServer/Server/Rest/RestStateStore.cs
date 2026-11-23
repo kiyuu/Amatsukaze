@@ -1023,6 +1023,7 @@ namespace Amatsukaze.Server.Rest
                     switch (item.Mode)
                     {
                         case ProcMode.TrimAdjust:
+                            return "カット調整中→" + (item.ConsoleId + 1);
                         case ProcMode.CMCheck:
                             return "CM解析中→" + (item.ConsoleId + 1);
                         case ProcMode.DrcsCheck:

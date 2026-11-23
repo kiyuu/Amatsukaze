@@ -37,7 +37,7 @@ public class NicoJKProgramStartTests
             mode: ProcMode.Batch, profile: profile, setting: setting, workPath: "work", isGeneric: false,
             src: "input.ts", srcOrg: null, dst: "output.mkv", json: "result.json", streamFormat: VideoStreamFormat.MPEG2,
             serviceId: 3088, logofiles: null, ignoreNoLogo: true, jlscommand: null, jlsopt: null, ceopt: null,
-            trimavs: null, divfile: null, resumeDir: null, batDir: "bat", inHandle: null, outHandle: null, pid: 0,
+            trimavs: null, divfile: null, resumeDir: null, resumeDatPath: null, batDir: "bat", inHandle: null, outHandle: null, pid: 0,
             programStart: new DateTime(2026, 10, 11, 1, 0, 0), nicoJKAlt: nicoJKAlt);
     }
 
