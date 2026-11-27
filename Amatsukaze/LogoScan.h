@@ -1002,6 +1002,10 @@ class LogoFrame : AMTObject {
     int numLogos;
     std::vector<LogoDataParam> logoArr;
     std::vector<LogoDataParam> deintArr;
+    std::vector<LogoLoadHash> loadedHashes;
+    std::vector<LogoHeader> loadedHeaders;
+    const float maskRatio;
+    bool logoDataPrepared;
 
     int maxYSize;
     int numFrames;
@@ -1015,6 +1019,8 @@ class LogoFrame : AMTObject {
 
     // 絶対値<0.2fは不明とみなす
     const float THRESH = 0.2f;
+
+    void prepareLogoData(const int index, const LogoHeader& header);
 
     int bestLogo;
     float logoRatio;
@@ -1150,7 +1156,15 @@ class LogoFrame : AMTObject {
     std::vector<LogoScore> calcLogoScore(const std::vector<std::pair<int, int>>& range, int numCandidates) const;
 
 public:
-    LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio);
+    int getMaxYSize() const { return maxYSize; }
+
+    LogoFrame(AMTContext& ctx, const std::vector<tstring>& logofiles, float maskratio,
+        bool captureHashes = false, bool deferPreparation = false);
+
+    const std::vector<LogoLoadHash>& getLoadedHashes() const { return loadedHashes; }
+
+    // 保存済み解析結果の確認後、通常走査が必要な場合にロゴ評価用データを準備する。
+    void prepareLogoData();
 
     void setClipInfo(PClip clip);
 
